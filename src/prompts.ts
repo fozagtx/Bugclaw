@@ -17,7 +17,8 @@ SOURCE_DATA=\${CITED_FILES_WITH_LINE_NUMBERS}`;
 
 const POC_RETRY = `Your previous proof-of-concept was inconclusive or did not follow the contract. Fix it. Same contract and keys as before. If the sandbox output shows the code is actually safe, it is valid to keep a correct test that prints BUGCLAW_SAFE; do not force a vulnerable result.
 PREVIOUS_POC=\${PREVIOUS_POC_JSON}
-SANDBOX_RESULT=\${ {exitCode, stdoutTail, stderrTail, timedOut} }
+SANDBOX_RESULT=\${SANDBOX_RESULT}
+CONTRACT_ERROR=\${CONTRACT_ERROR}
 CANDIDATE_DATA=\${CANDIDATE_JSON}
 SOURCE_DATA=\${CITED_FILES_WITH_LINE_NUMBERS}`;
 

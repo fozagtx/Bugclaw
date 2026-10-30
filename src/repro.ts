@@ -2,7 +2,7 @@ import { copyFile, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promi
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
-import { resolve, join, dirname, extname, basename, sep } from "node:path";
+import { resolve, join, dirname, extname, basename, sep, posix } from "node:path";
 import { config } from "./config.ts";
 import { NebiusClient } from "./nebius.ts";
 import { Sandbox, SandboxError } from "./sandbox.ts";
@@ -13,6 +13,8 @@ import { Store } from "./store.ts";
 const exec = promisify(execFile);
 const tail = (text: string) => text.slice(-12000);
 const cited = (data: any): string[] => [...new Set((data.finding?.evidence ?? data.evidence ?? []).map((item: any) => item.path).filter((item: unknown) => typeof item === "string"))];
+const JS_SOURCE_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".jsx", ".ts", ".tsx"]);
+const IMPORT_EXTENSIONS = [".js", ".cjs", ".mjs", ".ts", ".json"];
 
 export function classify(result: { exitCode: number; timedOut: boolean; stdout: string }): "vulnerable" | "safe" | "inconclusive" {
 	if (!result.timedOut && result.exitCode === 1 && result.stdout.includes("BUGCLAW_VULNERABLE")) return "vulnerable";
@@ -36,7 +38,7 @@ function repairEscapedContent(content: string): { content: string; repaired?: "u
 	};
 }
 
-export function validatePoc(poc: any, citedFiles: string[]) {
+export function validatePoc(poc: any, citedFiles: string[], snapshotFiles: string[]) {
 	if (!poc || !Array.isArray(poc.files) || poc.files.length < 1 || poc.files.length > 3 || !Array.isArray(poc.command) || !poc.command.length || poc.command.some((part: unknown) => typeof part !== "string")) throw new Error("invalid PoC shape");
 	if (!["node", "python3", "forge", "anvil"].includes(poc.command[0]) || poc.command.some((part: string) => /node_modules/.test(part))) {
 		throw new Error("invalid PoC command");
@@ -50,6 +52,19 @@ export function validatePoc(poc: any, citedFiles: string[]) {
 		file.content = normalized.content;
 		repaired ??= normalized.repaired;
 		if (file.content.split("\n").length > 120) throw new Error("PoC exceeds 120 lines");
+	}
+	const availablePaths = new Set([...poc.files.map((file: any) => file.path.replaceAll("\\", "/")), ...snapshotFiles]);
+	for (const file of poc.files) {
+		const filePath = file.path.replaceAll("\\", "/");
+		if (!JS_SOURCE_EXTENSIONS.has(posix.extname(filePath).toLowerCase())) continue;
+		for (const match of file.content.matchAll(/(?:require\s*\(\s*|from\s+|import\s*\(\s*)["'](\.{1,2}\/[^"']+)["']/g)) {
+			const spec = match[1];
+			const resolved = posix.normalize(posix.join(posix.dirname(filePath), spec));
+			if (availablePaths.has(resolved) || IMPORT_EXTENSIONS.some((extension) => availablePaths.has(`${resolved}${extension}`)) || availablePaths.has(`${resolved}/index.js`)) continue;
+			const specBasename = posix.basename(spec);
+			const guess = snapshotFiles.find((candidate) => posix.basename(candidate) === specBasename) ?? citedFiles[0] ?? "";
+			throw new Error(`${file.path} imports "${spec}", which resolves to ${resolved} and does not exist. Load snapshot files by absolute path, e.g. require(require("path").resolve(process.cwd(), "${guess}"))`);
+		}
 	}
 	const references = [...poc.files.map((file: any) => file.content), ...poc.command].join("\n");
 	if (!citedFiles.some((file) => references.includes(file) || references.includes(basename(file, extname(file)))) ) throw new Error("does not exercise cited code");
@@ -79,6 +94,8 @@ export async function reproduce(scanId: string, candidateId?: string, services: 
 	const candidates = store.candidates(scanId) as Array<{id:string; data:string}>;
 	const rows = candidates.filter((row) => !candidateId || row.id === candidateId);
 	if (!rows.length) throw new Error("No matching candidate");
+	const manifest = JSON.parse(await readFile(join(cfg.dataDir, "scans", scanId, "manifest.json"), "utf8")) as Array<{ path: string }>;
+	const snapshotFiles = manifest.map((item) => item.path);
 	const output = [];
 	for (const row of rows) {
 		const raw = JSON.parse(row.data);
@@ -94,6 +111,8 @@ export async function reproduce(scanId: string, candidateId?: string, services: 
 		let poc: any = null;
 		let pocRepair: "unescaped-newlines" | undefined;
 		let vulnerableRun: any = null;
+		let contractError = "none";
+		let retrySandboxResult: unknown = { notRun: true };
 		let status = "inconclusive";
 		for (let n = 1; n <= 3; n++) {
 			const started = new Date().toISOString();
@@ -104,12 +123,22 @@ export async function reproduce(scanId: string, candidateId?: string, services: 
 					CANDIDATE_JSON: raw,
 					CITED_FILES_WITH_LINE_NUMBERS: citedFilesWithLines,
 					PREVIOUS_POC_JSON: poc,
-					SANDBOX_RESULT: vulnerableRun && { exitCode: vulnerableRun.exitCode, stdoutTail: tail(vulnerableRun.stdout), stderrTail: tail(vulnerableRun.stderr), timedOut: vulnerableRun.timedOut },
+					SANDBOX_RESULT: retrySandboxResult,
+					CONTRACT_ERROR: contractError,
 				});
 				const generated = await model.complete(cfg.models.repro, prompt.system, prompt.prompt, OUTPUT_SCHEMAS[promptName]);
 				poc = generated.value;
-				pocRepair = validatePoc(poc, files);
+				try {
+					pocRepair = validatePoc(poc, files, snapshotFiles);
+				} catch (error) {
+					contractError = error instanceof Error ? error.message : String(error);
+					retrySandboxResult = { notRun: true };
+					store.attempt(row.id, "poc", { status: "invalid", reason: contractError });
+					continue;
+				}
 				const result = await sandbox.run(snapshot, poc.files, poc.command, 120);
+				contractError = "none";
+				retrySandboxResult = { exitCode: result.exitCode, stdoutTail: tail(result.stdout), stderrTail: tail(result.stderr), timedOut: result.timedOut };
 				const classification = classify(result);
 				const evidence = await writeEvidence({
 					dataDir: cfg.dataDir, scanId, candidateId: row.id, runId, step: "poc", number: n, files: poc.files, argv: poc.command, run: result,

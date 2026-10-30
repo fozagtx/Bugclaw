@@ -6,7 +6,7 @@ import { join, resolve } from "node:path";
 import test from "node:test";
 import { Sandbox } from "../src/sandbox.ts";
 import { firstJson, NebiusClient, parseChatResponse } from "../src/nebius.ts";
-import { OUTPUT_SCHEMAS } from "../src/prompts.ts";
+import { OUTPUT_SCHEMAS, renderPrompt } from "../src/prompts.ts";
 import { makeSnapshot } from "../src/snapshot.ts";
 import { classify, validateFixFiles, validatePoc } from "../src/repro.ts";
 import { evidencePath, writeEvidence } from "../src/evidence.ts";
@@ -69,21 +69,56 @@ test("POC classification requires both the marker and its specified exit code", 
 
 test("POC files stay under the reserved directory and cite source", () => {
 	const cited = ["src/config.ts"];
-	assert.doesNotThrow(() => validatePoc({ files: [{ path: ".bugclaw/poc/check.js", content: "require('../../src/config.ts')" }], command: ["node", ".bugclaw/poc/check.js"] }, cited));
-	assert.throws(() => validatePoc({ files: [{ path: "../check.js", content: "require('src/config.ts')" }], command: ["node"] }, cited), /under .bugclaw\/poc/);
-	assert.throws(() => validatePoc({ files: [{ path: "/tmp/check.js", content: "require('src/config.ts')" }], command: ["node"] }, cited), /under .bugclaw\/poc/);
-	assert.throws(() => validatePoc({ files: [{ path: ".bugclaw/poc/check.js", content: "console.log('safe')" }], command: ["node"] }, cited), /does not exercise cited code/);
+	assert.doesNotThrow(() => validatePoc({ files: [{ path: ".bugclaw/poc/check.js", content: "require('../../src/config.ts')" }], command: ["node", ".bugclaw/poc/check.js"] }, cited, ["src/config.ts"]));
+	assert.throws(() => validatePoc({ files: [{ path: "../check.js", content: "require('src/config.ts')" }], command: ["node"] }, cited, ["src/config.ts"]), /under .bugclaw\/poc/);
+	assert.throws(() => validatePoc({ files: [{ path: "/tmp/check.js", content: "require('src/config.ts')" }], command: ["node"] }, cited, ["src/config.ts"]), /under .bugclaw\/poc/);
+	assert.throws(() => validatePoc({ files: [{ path: ".bugclaw/poc/check.js", content: "console.log('safe')" }], command: ["node"] }, cited, ["src/config.ts"]), /does not exercise cited code/);
 });
 
 test("POC command requires a bare supported interpreter", () => {
 	const validate = (command: string[]) => validatePoc({
 		files: [{ path: ".bugclaw/poc/test.js", content: "require('../../src/config.ts')" }],
 		command,
-	}, ["src/config.ts"]);
+	}, ["src/config.ts"], ["src/config.ts"]);
 	assert.throws(() => validate([".bugclaw/poc/test.js"]), /invalid PoC command/);
 	assert.throws(() => validate(["./node_modules/.bin/node", ".bugclaw/poc/test.js"]), /invalid PoC command/);
 	assert.doesNotThrow(() => validate(["node", ".bugclaw/poc/test.js"]));
 	assert.throws(() => validate(["node", "./node_modules/.bin/node"]), /invalid PoC command/);
+});
+
+test("POC relative imports must resolve to a PoC or snapshot file", () => {
+	const command = ["node", ".bugclaw/poc/test.js"];
+	const invalid = {
+		files: [{ path: ".bugclaw/poc/test.js", content: "require('../index.js')" }],
+		command,
+	};
+	assert.throws(() => validatePoc(invalid, ["index.js"], ["index.js"]), /resolve\(process\.cwd\(\), "index\.js"\)/);
+
+	const validSnapshotImport = {
+		files: [{ path: ".bugclaw/poc/test.js", content: "require('../../index.js')" }],
+		command,
+	};
+	assert.doesNotThrow(() => validatePoc(validSnapshotImport, ["index.js"], ["index.js"]));
+
+	const validPocImport = {
+		files: [
+			{ path: ".bugclaw/poc/test.js", content: "require('./helper')" },
+			{ path: ".bugclaw/poc/helper.js", content: "module.exports = 1" },
+		],
+		command,
+	};
+	assert.doesNotThrow(() => validatePoc(validPocImport, ["helper.js"], ["helper.js"]));
+
+	const absoluteImport = {
+		files: [{ path: ".bugclaw/poc/test.js", content: 'require(require("path").resolve(process.cwd(), "index.js"))' }],
+		command,
+	};
+	assert.doesNotThrow(() => validatePoc(absoluteImport, ["index.js"], ["index.js"]));
+});
+
+test("POC_RETRY renders the previous contract error", () => {
+	const prompt = renderPrompt("POC_RETRY", { CONTRACT_ERROR: "missing import", SANDBOX_RESULT: { notRun: true } }).prompt;
+	assert.ok(prompt.includes('SANDBOX_RESULT={"notRun":true}\nCONTRACT_ERROR="missing import"'));
 });
 
 test("POC validation repairs escaped file text once and preserves files with real newlines", () => {
@@ -91,7 +126,7 @@ test("POC validation repairs escaped file text once and preserves files with rea
 		files: [{ path: ".bugclaw/poc/check.js", content: "require('../../src/config.ts');\\nconsole.log(\\\"ok\\\");\\nconst tab = 'a\\tb';\\nconst slash = 'c\\\\d';" }],
 		command: ["node", ".bugclaw/poc/check.js"],
 	};
-	assert.equal(validatePoc(escaped, ["src/config.ts"]), "unescaped-newlines");
+	assert.equal(validatePoc(escaped, ["src/config.ts"], ["src/config.ts"]), "unescaped-newlines");
 	assert.equal(escaped.files[0].content, "require('../../src/config.ts');\nconsole.log(\"ok\");\nconst tab = 'a\tb';\nconst slash = 'c\\d';");
 
 	const realNewlines = {
@@ -99,7 +134,7 @@ test("POC validation repairs escaped file text once and preserves files with rea
 		command: ["node", ".bugclaw/poc/check.js"],
 	};
 	const original = realNewlines.files[0].content;
-	assert.equal(validatePoc(realNewlines, ["src/config.ts"]), undefined);
+	assert.equal(validatePoc(realNewlines, ["src/config.ts"], ["src/config.ts"]), undefined);
 	assert.equal(realNewlines.files[0].content, original);
 });
 
