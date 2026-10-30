@@ -31,13 +31,7 @@ const tools = [
 	{ name: "bugclaw_evidence", description: `Read replayable evidence stored inside Bugclaw's data directory. ${signoffDescription}`, inputSchema: {type:"object",properties:{path:{type:"string"}},required:["path"]} },
 ];
 
-export async function serve(port = 8787, store = new Store(), options: ServeOptions = {}) {
-	const host = options.host ?? "127.0.0.1";
-	const { tlsCert, tlsKey } = options;
-	if (Boolean(tlsCert) !== Boolean(tlsKey)) throw new Error("Both --tls-cert and --tls-key are required");
-	const { mcpToken } = config();
-	if (!isLoopbackHost(host) && !mcpToken) throw new Error("BUGCLAW_MCP_TOKEN is required to bind a non-loopback host");
-	const mcpOnly = servesOnlyMcp(host);
+function createMcp(store: Store) {
 	const mcp = new McpServer({ name: "bugclaw", version: "0.1.0" }, { capabilities: { tools: {} } });
 	mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
 	mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -55,8 +49,16 @@ export async function serve(port = 8787, store = new Store(), options: ServeOpti
 		} else throw new Error(`Unknown tool ${name}; signoff is human-only and is not an MCP tool`);
 		return { content: [{ type: "text", text: JSON.stringify(result) }] };
 	});
-	const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-	await mcp.connect(transport);
+	return mcp;
+}
+
+export async function serve(port = 8787, store = new Store(), options: ServeOptions = {}) {
+	const host = options.host ?? "127.0.0.1";
+	const { tlsCert, tlsKey } = options;
+	if (Boolean(tlsCert) !== Boolean(tlsKey)) throw new Error("Both --tls-cert and --tls-key are required");
+	const { mcpToken } = config();
+	if (!isLoopbackHost(host) && !mcpToken) throw new Error("BUGCLAW_MCP_TOKEN is required to bind a non-loopback host");
+	const mcpOnly = servesOnlyMcp(host);
 	const handler = async (req: any, res: any) => {
 		const rawPath = (req.url ?? "/").split("?", 1)[0] ?? "/";
 		let decodedPath: string;
@@ -70,6 +72,13 @@ export async function serve(port = 8787, store = new Store(), options: ServeOpti
 				res.end(JSON.stringify({ error: "unauthorized" }));
 				return;
 			}
+			const mcp = createMcp(store);
+			const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+			res.once("close", () => {
+				void transport.close();
+				void mcp.close();
+			});
+			await mcp.connect(transport);
 			await transport.handleRequest(req,res);
 			return;
 		}
@@ -177,7 +186,7 @@ export async function serve(port = 8787, store = new Store(), options: ServeOpti
 		server.once("error", reject);
 		server.listen(port, host, resolvePromise);
 	});
-	return { server, port, host, close: async()=>{await mcp.close();await new Promise<void>((r)=>server.close(()=>r()));} };
+	return { server, port, host, close: async()=>{await new Promise<void>((r)=>server.close(()=>r()));} };
 }
 
 async function exists(path:string){try{await access(path);return true;}catch{return false;}}

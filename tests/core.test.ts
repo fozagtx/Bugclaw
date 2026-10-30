@@ -104,15 +104,24 @@ test("MCP bearer authentication and non-loopback binding require the configured 
 		protectedService = await serve(0, store);
 		const protectedAddress = protectedService.server.address();
 		assert.ok(protectedAddress && typeof protectedAddress !== "string");
-		const postInitialize = (port: number, authorization?: string) => fetch(`http://127.0.0.1:${port}/mcp`, {
+		const postMcp = (port: number, body: string, authorization?: string) => fetch(`http://127.0.0.1:${port}/mcp`, {
 			method: "POST",
 			headers: {
 				accept: "application/json, text/event-stream",
 				"content-type": "application/json",
 				...(authorization ? { authorization } : {}),
 			},
-			body: initializeBody,
+			body,
 		});
+		const postInitialize = (port: number, authorization?: string) => postMcp(port, initializeBody, authorization);
+		const readJsonRpc = async (response: any) => {
+			const body = await response.text();
+			if (response.headers.get("content-type")?.includes("text/event-stream")) {
+				const dataLines = body.split(/\r?\n/).filter((line: string) => line.startsWith("data:"));
+				return JSON.parse(dataLines.at(-1)!.slice(5).trim());
+			}
+			return JSON.parse(body);
+		};
 		const missing = await postInitialize(protectedAddress.port);
 		assert.equal(missing.status, 401);
 		assert.equal(missing.headers.get("www-authenticate"), "Bearer");
@@ -121,9 +130,28 @@ test("MCP bearer authentication and non-loopback binding require the configured 
 		assert.equal(wrong.status, 401);
 		assert.equal(wrong.headers.get("www-authenticate"), "Bearer");
 		assert.deepEqual(await wrong.json(), { error: "unauthorized" });
-		const authorized = await postInitialize(protectedAddress.port, "Bearer expected-secret");
-		assert.notEqual(authorized.status, 401);
-		await authorized.text();
+		for (let index = 0; index < 2; index++) {
+			const initialized = await postInitialize(protectedAddress.port, "Bearer expected-secret");
+			assert.equal(initialized.status, 200);
+			const response = await readJsonRpc(initialized);
+			assert.equal(response.result.serverInfo.name, "bugclaw");
+		}
+		const listed = await postMcp(
+			protectedAddress.port,
+			JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }),
+			"Bearer expected-secret",
+		);
+		assert.equal(listed.status, 200);
+		const listedResult = await readJsonRpc(listed);
+		const toolNames = listedResult.result.tools.map((tool: { name: string }) => tool.name);
+		assert.deepEqual(toolNames, [
+			"bugclaw_scan",
+			"bugclaw_status",
+			"bugclaw_candidates",
+			"bugclaw_reproduce",
+			"bugclaw_evidence",
+		]);
+		assert.equal(toolNames.some((name: string) => /signoff/i.test(name)), false);
 
 		privateService = await serve(0, store, { host: "0.0.0.0" });
 		const privateAddress = privateService.server.address();
@@ -139,9 +167,8 @@ test("MCP bearer authentication and non-loopback binding require the configured 
 		assert.equal(privateSignoff.status, 404);
 		assert.deepEqual(await privateSignoff.json(), { error: "not found" });
 		const privateMcp = await postInitialize(privateAddress.port, "Bearer expected-secret");
-		assert.notEqual(privateMcp.status, 404);
-		assert.notEqual(privateMcp.status, 401);
-		await privateMcp.text();
+		assert.equal(privateMcp.status, 200);
+		assert.equal((await readJsonRpc(privateMcp)).result.serverInfo.name, "bugclaw");
 
 		delete process.env.BUGCLAW_MCP_TOKEN;
 		await assert.rejects(
@@ -152,8 +179,8 @@ test("MCP bearer authentication and non-loopback binding require the configured 
 		const unprotectedAddress = unprotectedService.server.address();
 		assert.ok(unprotectedAddress && typeof unprotectedAddress !== "string");
 		const unauthenticated = await postInitialize(unprotectedAddress.port);
-		assert.notEqual(unauthenticated.status, 401);
-		await unauthenticated.text();
+		assert.equal(unauthenticated.status, 200);
+		assert.equal((await readJsonRpc(unauthenticated)).result.serverInfo.name, "bugclaw");
 	} finally {
 		if (unprotectedService) await unprotectedService.close();
 		if (privateService) await privateService.close();
