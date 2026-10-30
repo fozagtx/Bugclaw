@@ -10,6 +10,7 @@ Contract:
 - Working directory is the snapshot root. Put every file you create under .bugclaw/poc/ (paths relative to the snapshot root). Snapshot files keep their paths, so load them by absolute path from the working directory, e.g. require(require("path").resolve(process.cwd(), "src/app.js")), never by a guessed relative path.
 - Each file's content is the raw file text with real line breaks; never write newlines as the two characters \\n.
 - Keep it under 120 lines and under 60 seconds of runtime.
+- command is argv with no shell: argv[0] must be exactly one of node, python3, forge or anvil (a bare name, never a path), and the remaining entries are its arguments, e.g. ["node", ".bugclaw/poc/test.js"]. PoC files are not executable, so never pass a script path as argv[0], and never reference node_modules or any interpreter path.
 Keys: files[{path,content}] (1-3 files), command (string[]; argv, no shell), rationale (string: which cited code path the test exercises and how the result proves or disproves the candidate).
 CANDIDATE_DATA=\${CANDIDATE_JSON}
 SOURCE_DATA=\${CITED_FILES_WITH_LINE_NUMBERS}`;

@@ -38,6 +38,9 @@ function repairEscapedContent(content: string): { content: string; repaired?: "u
 
 export function validatePoc(poc: any, citedFiles: string[]) {
 	if (!poc || !Array.isArray(poc.files) || poc.files.length < 1 || poc.files.length > 3 || !Array.isArray(poc.command) || !poc.command.length || poc.command.some((part: unknown) => typeof part !== "string")) throw new Error("invalid PoC shape");
+	if (!["node", "python3", "forge", "anvil"].includes(poc.command[0]) || poc.command.some((part: string) => /node_modules/.test(part))) {
+		throw new Error("invalid PoC command");
+	}
 	let repaired: "unescaped-newlines" | undefined;
 	for (const file of poc.files) {
 		if (typeof file.path !== "string" || typeof file.content !== "string") throw new Error("invalid PoC file");
@@ -71,6 +74,7 @@ export async function reproduce(scanId: string, candidateId?: string, services: 
 	const model = services.model ?? new NebiusClient();
 	const sandbox = services.sandbox ?? new Sandbox();
 	const cfg = config();
+	const runId = `${new Date().toISOString().replace(/[-:.]/g, "")}-${randomUUID().slice(0, 8)}`;
 	if (!process.env.NEBIUS_API_KEY) throw new Error("NEBIUS_API_KEY is required");
 	const candidates = store.candidates(scanId) as Array<{id:string; data:string}>;
 	const rows = candidates.filter((row) => !candidateId || row.id === candidateId);
@@ -108,7 +112,7 @@ export async function reproduce(scanId: string, candidateId?: string, services: 
 				const result = await sandbox.run(snapshot, poc.files, poc.command, 120);
 				const classification = classify(result);
 				const evidence = await writeEvidence({
-					dataDir: cfg.dataDir, scanId, candidateId: row.id, step: "poc", number: n, files: poc.files, argv: poc.command, run: result,
+					dataDir: cfg.dataDir, scanId, candidateId: row.id, runId, step: "poc", number: n, files: poc.files, argv: poc.command, run: result,
 					meta: { snapshotHash: (store.scan(scanId) as any)?.snapshot_hash, ...result, modelId: cfg.models.repro, tokens: { input: generated.inputTokens, output: generated.outputTokens }, classification, ...(pocRepair ? { repaired: pocRepair } : {}), startedAt: started, endedAt: new Date().toISOString() },
 				});
 				store.attempt(row.id, "poc", { status: classification, evidence });
@@ -188,7 +192,7 @@ export async function reproduce(scanId: string, candidateId?: string, services: 
 						const diff = await getDiff(snapshot, patched);
 						const classification = classify(result);
 						await writeEvidence({
-							dataDir: cfg.dataDir, scanId, candidateId: row.id, step: "fix", number: attempt + 1, files: [...poc.files, ...fixFiles], argv: poc.command, run: result,
+							dataDir: cfg.dataDir, scanId, candidateId: row.id, runId, step: "fix", number: attempt + 1, files: [...poc.files, ...fixFiles], argv: poc.command, run: result,
 							meta: { snapshotHash: (store.scan(scanId) as any)?.snapshot_hash, ...result, modelId: cfg.models.fix, tokens: { input: proposal.inputTokens, output: proposal.outputTokens }, classification, ...(pocRepair || fixRepair ? { repaired: "unescaped-newlines" } : {}), startedAt: fixStarted, endedAt: new Date().toISOString() },
 							fixDiff: diff,
 						});

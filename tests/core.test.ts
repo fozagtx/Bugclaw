@@ -75,6 +75,17 @@ test("POC files stay under the reserved directory and cite source", () => {
 	assert.throws(() => validatePoc({ files: [{ path: ".bugclaw/poc/check.js", content: "console.log('safe')" }], command: ["node"] }, cited), /does not exercise cited code/);
 });
 
+test("POC command requires a bare supported interpreter", () => {
+	const validate = (command: string[]) => validatePoc({
+		files: [{ path: ".bugclaw/poc/test.js", content: "require('../../src/config.ts')" }],
+		command,
+	}, ["src/config.ts"]);
+	assert.throws(() => validate([".bugclaw/poc/test.js"]), /invalid PoC command/);
+	assert.throws(() => validate(["./node_modules/.bin/node", ".bugclaw/poc/test.js"]), /invalid PoC command/);
+	assert.doesNotThrow(() => validate(["node", ".bugclaw/poc/test.js"]));
+	assert.throws(() => validate(["node", "./node_modules/.bin/node"]), /invalid PoC command/);
+});
+
 test("POC validation repairs escaped file text once and preserves files with real newlines", () => {
 	const escaped = {
 		files: [{ path: ".bugclaw/poc/check.js", content: "require('../../src/config.ts');\\nconsole.log(\\\"ok\\\");\\nconst tab = 'a\\tb';\\nconst slash = 'c\\\\d';" }],
@@ -106,6 +117,23 @@ test("fix validation repairs literal escaped newlines", () => {
 test("evidence paths cannot escape the scans directory", () => {
 	assert.throws(() => evidencePath("/private/data", "../../outside.txt"), /outside data\/scans/);
 	assert.ok(evidencePath("/private/data", "scan/evidence/candidate/poc-1/stdout.txt").startsWith("/private/data/scans/"));
+});
+
+test("evidence for repeated runs of one candidate uses distinct paths", async () => {
+	const root = await mkdtemp(join(tmpdir(), "bugclaw-evidence-"));
+	const input = {
+		dataDir: root, scanId: "scan", candidateId: "candidate", runId: "20260601T120000000Z-first",
+		step: "poc", number: 1, files: [], argv: ["node"], run: { stdout: "", stderr: "", exitCode: 0, timedOut: false }, meta: {},
+	};
+	try {
+		const first = await writeEvidence(input);
+		const second = await writeEvidence({ ...input, runId: "20260601T120100000Z-second" });
+		assert.notEqual(first, second);
+		assert.match(first, /candidate\/20260601T120000000Z-first\/poc-1$/);
+		assert.match(second, /candidate\/20260601T120100000Z-second\/poc-1$/);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
 });
 
 test("source snapshot manifests and hashes are deterministic", async () => {
@@ -160,7 +188,7 @@ test("OpenShell uploads snapshot and PoC at the work root and denies network acc
 		assert.equal(safe.exitCode, 0, safe.stderr);
 		assert.match(safe.stdout, /BUGCLAW_SAFE/);
 		const evidence = await writeEvidence({
-			dataDir: data, scanId: "integration", candidateId: "layout",
+			dataDir: data, scanId: "integration", candidateId: "layout", runId: "integration-run",
 			step: "poc", number: 1, files: [poc], argv, run: safe,
 			meta: { ...safe, classification: "safe" },
 		});
