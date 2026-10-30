@@ -73,6 +73,9 @@ export async function serve(port = 8787, store = new Store(), options: ServeOpti
 				res.end(JSON.stringify({ error: "unauthorized" }));
 				return;
 			}
+			if (!mcpToken && !isLoopbackHost(hostnameFromHost(req.headers.host ?? ""))) {
+				return json(res, 403, { error: "MCP without BUGCLAW_MCP_TOKEN is only served to loopback hosts" });
+			}
 			const mcp = createMcp(store);
 			const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
 			res.once("close", () => {
@@ -86,6 +89,7 @@ export async function serve(port = 8787, store = new Store(), options: ServeOpti
 		try {
 			if (req.method === "GET" && url.pathname === "/api/health") {
 				const key = Boolean(process.env.NEBIUS_API_KEY);
+				const current = config();
 				let models: string[] = [];
 				let modelError: string | undefined;
 				if (key) try { models = await new NebiusClient().listModels(); } catch (e) { modelError = String(e); }
@@ -94,7 +98,13 @@ export async function serve(port = 8787, store = new Store(), options: ServeOpti
 					exec("docker",["info"]).then(()=>true).catch(()=>false),
 					runnerImageTag().then((tag)=>exec("docker",["image","inspect",tag])).then(()=>true).catch(()=>false),
 				]);
-				return json(res,200,{nebius:{keyPresent:key,modelsAvailable:models.length>0,modelError},openshell,docker,engine:await exists(config().engineDir),runnerImage:runner});
+				return json(res,200,{nebius:{keyPresent:key,modelsAvailable:models.length>0,modelError},openshell,docker,engine:await exists(current.engineDir),runnerImage:runner,env:{nebiusApiKey:key,nebiusBaseUrl:current.baseUrl,dataDirCustom:Boolean(process.env.BUGCLAW_DATA),mcpToken:Boolean(process.env.BUGCLAW_MCP_TOKEN)}});
+			}
+			if (req.method === "GET" && url.pathname === "/api/activity") {
+				const value = url.searchParams.get("limit");
+				const requested = value === null ? 20 : Number(value);
+				const limit = Number.isFinite(requested) ? Math.max(1, Math.min(50, Math.trunc(requested))) : 20;
+				return json(res,200,store.recentActivity(limit));
 			}
 			if (req.method === "GET" && url.pathname === "/api/scans") return json(res,200,store.scans());
 			if (req.method === "POST" && url.pathname === "/api/scans") {
@@ -228,6 +238,15 @@ function isLoopbackHost(host: string) {
 	const normalized = host.toLowerCase().replace(/^\[|\]$/g, "");
 	if (normalized === "localhost" || normalized.endsWith(".localhost") || normalized === "::1") return true;
 	return isIP(normalized) === 4 && Number(normalized.split(".", 1)[0]) === 127;
+}
+function hostnameFromHost(host: string) {
+	const value = host.trim();
+	if (value.startsWith("[")) {
+		const end = value.indexOf("]");
+		return end < 0 ? value : value.slice(1, end);
+	}
+	const colon = value.lastIndexOf(":");
+	return colon >= 0 && value.indexOf(":") === colon ? value.slice(0, colon) : value;
 }
 function servesOnlyMcp(host: string) {
 	return !isLoopbackHost(host);
