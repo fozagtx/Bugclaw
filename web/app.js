@@ -277,7 +277,7 @@ async function scanDetail(id, tab) {
   else if (tab === "activity") activityTab(el, tasks, titles);
   else if (tab === "exploration") explorationTab(el, s, tasks, checks, titles);
   else if (tab === "assets") assetsTab(el, act.files ?? [], cands);
-  else if (tab === "report") await reportTab(el, s.id);
+  else if (tab === "report") await reportTab(el, s, cands);
   else if (tab === "findings") el.innerHTML = `<div class="card"><div class="hd"><h3>Findings</h3><span class="aside">${live ? "Scan still running" : `${cands.length} candidates`}</span></div>${candidateTable(cands, { scanLive: live })}</div><p class="foot">Validator verdicts are model opinions. Only the sandbox column reflects code that actually ran, and only a person can confirm a finding.</p>`;
   else overviewTab(el, s, report, tasks, act, cands, live);
   if (live) timers.push(setInterval(async () => {
@@ -359,15 +359,30 @@ function overviewTab(el, s, report, tasks, act, cands, live) {
   </div>`;
 }
 
-async function reportTab(el, id) {
-  const r = await api(`/api/scans/${encodeURIComponent(id)}/report`).catch((e) => ({ error: e.message }));
-  if (r.error) { el.innerHTML = `<div class="card"><div class="pad error">${esc(r.error)}</div></div>`; return; }
-  const docs = [["Bug report", r.markdown], ["Finding detail", r.findingsDetail]].filter(([, v]) => v);
-  if (!docs.length) { el.innerHTML = `<div class="card dashed"><div class="empty"><b>No report yet</b>The engine writes its report when the scan finishes.</div></div>`; return; }
-  el.innerHTML = `<div class="card"><div class="hd"><h3>Engine report</h3><div class="seg" id="docsel">${docs.map(([n], i) => `<button data-i="${i}" class="${i ? "" : "on"}">${esc(n)}</button>`).join("")}</div></div><div class="pad"><pre id="doc" style="max-height:none"></pre></div></div>`;
-  const show = (i) => { document.getElementById("doc").textContent = docs[i][1]; el.querySelectorAll("#docsel button").forEach((b) => b.classList.toggle("on", Number(b.dataset.i) === i)); };
-  el.querySelectorAll("#docsel button").forEach((b) => b.addEventListener("click", () => show(Number(b.dataset.i))));
-  show(0);
+async function reportTab(el, s, cands) {
+  const rank = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
+  const [details, engine] = await Promise.all([
+    Promise.all([...cands].sort((a, b) => (rank[a.severity] ?? 9) - (rank[b.severity] ?? 9)).map((c) => api(`/api/candidates/${encodeURIComponent(c.id)}`).catch(() => c))),
+    api(`/api/scans/${encodeURIComponent(s.id)}/report`).catch(() => ({})),
+  ]);
+  const rows = details.map((c) => {
+    const d = parse(c.data) ?? c.data ?? {};
+    const fix = [...(c.attempts ?? [])].reverse().map((a) => ({ ...a, result: parse(a.result) })).find((a) => a.step === "fix" && a.result?.summary);
+    return { c, d, fix: fix?.result?.summary, where: (d.evidence ?? []).map((e) => `${e.path}:${e.startLine}`).join(", "), human: (c.signoffs ?? []).at(-1)?.decision };
+  });
+  const proven = rows.filter(({ c }) => ["reproduced", "fix-verified", "fix-failed"].includes(c.status)).length;
+  const fixed = rows.filter(({ c }) => c.status === "fix-verified").length;
+  const md = [`# Bugclaw report: ${s.source}`, "", `Scan ${s.id}`, "", `${rows.length} findings, ${proven} proven in an OpenShell sandbox, ${fixed} fix verified.`, "",
+    ...rows.flatMap(({ c, d, fix, where, human }) => [`## ${c.title}`, "", `- Severity: ${c.severity}`, `- Where: ${where || "-"}`, `- Validator: ${words(d.validation ?? d.status ?? "-")}`, `- Sandbox: ${words(sandboxStatus(c))}`, `- Human signoff: ${human ?? "waiting"}`, "", d.rootCause ?? "", "", fix ? `Fix: ${fix}` : "", ""])].join("\n");
+  el.innerHTML = `<div class="card"><div class="hd"><h3>Bug report</h3><div style="display:flex;gap:10px;align-items:center"><span class="aside">${rows.length} findings · ${proven} proven · ${fixed} fix verified</span><button class="btn ghost" id="dl" style="height:32px">Download .md</button></div></div>
+    ${rows.length ? rows.map(({ c, d, fix, where, human }) => `<div class="pad" style="border-top:1px solid var(--line)">
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">${pill(c.severity)}<a href="/candidates/${encodeURIComponent(c.id)}" data-link style="font:700 17px/1.25 var(--display);letter-spacing:-.02em;color:var(--ink);text-decoration:none">${esc(c.title)}</a></div>
+      <dl class="kv wide" style="margin-top:12px"><dt>Where</dt><dd class="mono">${esc(where || "—")}</dd><dt>Validator</dt><dd>${pill(d.validation ?? d.status)}</dd><dt>Sandbox</dt><dd>${sandboxPill(c)}</dd><dt>Signoff</dt><dd>${human ? pill(human) : `<span class="pill plain">Waiting</span>`}</dd>
+      <dt>Root cause</dt><dd class="clamp">${esc(d.rootCause ?? "—")}</dd>${fix ? `<dt>Fix</dt><dd class="clamp">${esc(fix)}</dd>` : ""}</dl></div>`).join("") : `<div class="empty"><b>No findings</b>The engine reported no candidates for this snapshot.</div>`}</div>
+    ${engine?.markdown ? `<div class="card"><div class="hd"><h3>Engine notes</h3><button class="btn ghost" id="eng" style="height:32px">Show</button></div><div class="pad" id="engbody" hidden><pre style="max-height:420px"></pre></div></div>` : ""}`;
+  document.getElementById("dl").addEventListener("click", () => { const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([md], { type: "text/markdown" })); a.download = `bugclaw-report-${s.id.slice(0, 8)}.md`; a.click(); });
+  const eng = document.getElementById("eng");
+  if (eng) eng.addEventListener("click", () => { const b = document.getElementById("engbody"); b.hidden = !b.hidden; b.querySelector("pre").textContent = engine.markdown; eng.textContent = b.hidden ? "Show" : "Hide"; });
 }
 
 function activityTab(el, tasks, titles) {
