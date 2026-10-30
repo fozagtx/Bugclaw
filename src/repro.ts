@@ -13,8 +13,23 @@ import { Store } from "./store.ts";
 const exec = promisify(execFile);
 const tail = (text: string) => text.slice(-12000);
 const cited = (data: any): string[] => [...new Set((data.finding?.evidence ?? data.evidence ?? []).map((item: any) => item.path).filter((item: unknown) => typeof item === "string"))];
+const PROVEN = new Set(["reproduced", "fix-verified", "fix-failed"]);
 const JS_SOURCE_EXTENSIONS = new Set([".js", ".cjs", ".mjs", ".jsx", ".ts", ".tsx"]);
 const IMPORT_EXTENSIONS = [".js", ".cjs", ".mjs", ".ts", ".json"];
+
+function saveReproOutcome(store: Store, row: { id: string; status: string }, data: Record<string, unknown>, status: string, reason?: string) {
+	const stored = { ...data };
+	if (PROVEN.has(row.status) && !PROVEN.has(status)) {
+		stored.lastRun = { status, reason: reason ?? null, at: new Date().toISOString() };
+		store.setCandidateStatus(row.id, row.status, stored);
+		return;
+	}
+	stored.reproStatus = status;
+	if (reason) stored.reproReason = reason;
+	else delete stored.reproReason;
+	delete stored.lastRun;
+	store.setCandidateStatus(row.id, status, stored);
+}
 
 export function classify(result: { exitCode: number; timedOut: boolean; stdout: string }): "vulnerable" | "safe" | "inconclusive" {
 	if (!result.timedOut && result.exitCode === 1 && result.stdout.includes("BUGCLAW_VULNERABLE")) return "vulnerable";
@@ -91,7 +106,7 @@ export async function reproduce(scanId: string, candidateId?: string, services: 
 	const cfg = config();
 	const runId = `${new Date().toISOString().replace(/[-:.]/g, "")}-${randomUUID().slice(0, 8)}`;
 	if (!process.env.NEBIUS_API_KEY) throw new Error("NEBIUS_API_KEY is required");
-	const candidates = store.candidates(scanId) as Array<{id:string; data:string}>;
+	const candidates = store.candidates(scanId) as Array<{id:string; status:string; data:string}>;
 	const rows = candidates.filter((row) => !candidateId || row.id === candidateId);
 	if (!rows.length) throw new Error("No matching candidate");
 	const manifest = JSON.parse(await readFile(join(cfg.dataDir, "scans", scanId, "manifest.json"), "utf8")) as Array<{ path: string }>;
@@ -103,8 +118,7 @@ export async function reproduce(scanId: string, candidateId?: string, services: 
 		if (!files.length) {
 			const reason = "candidate has no cited source files";
 			store.attempt(row.id, "poc", { status: "not-reproducible", reason });
-			const stored = { ...raw, reproStatus: "not-reproducible", reproReason: reason };
-			store.setCandidateStatus(row.id, "not-reproducible", stored);
+			saveReproOutcome(store, row, raw, "not-reproducible", reason);
 			output.push({ candidateId: row.id, status: "not-reproducible", attempts: store.attempts(row.id).length, reason });
 			continue;
 		}
@@ -274,11 +288,7 @@ export async function reproduce(scanId: string, candidateId?: string, services: 
 				if (status !== "sandbox-error") status = fixed ? "fix-verified" : "fix-failed";
 			}
 		}
-		const stored = JSON.parse(row.data);
-		stored.reproStatus = status;
-		if (terminalReason) stored.reproReason = terminalReason;
-		else delete stored.reproReason;
-		store.setCandidateStatus(row.id, status, stored);
+		saveReproOutcome(store, row, raw, status, terminalReason);
 		output.push({ candidateId: row.id, status, attempts: store.attempts(row.id).length, ...(terminalReason ? { reason: terminalReason } : {}) });
 	}
 	return output;

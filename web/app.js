@@ -446,7 +446,7 @@ async function candidate(id) {
   view.innerHTML = top(c.title, { back: { href: `/scans/${encodeURIComponent(c.scan_id)}/findings` }, extra: `${pill(c.severity)}<span class="src"></span><button class="btn sm" id="repro">Run in OpenShell</button>` }) + `
   <div class="tabs">${tabs.map(([k, l, n]) => `<a href="?tab=${k}" data-tab="${k}" class="${tab === k ? "on" : ""}">${l}${n ? `<span class="n">${n}</span>` : ""}</a>`).join("")}</div>
   <div class="body">
-    <div class="card verdict">${stepState.map(([label, p, note], i) => `<div><span class="no">0${i + 1}</span><b>${label}</b>${p}<p>${esc(note)}</p></div>`).join("")}</div>
+    <div class="card verdict">${stepState.map(([label, p, note], i) => `<div><span class="no">0${i + 1}</span><b>${label}</b>${p}<p>${esc(note)}</p>${label === "Proved" && d.lastRun ? `<p>Latest run: ${esc(words(d.lastRun.status))}</p>` : ""}</div>`).join("")}</div>
     <p class="muted" id="repro-msg" style="margin:-8px 0 16px"></p>
     <div id="ctab"></div>
   </div>`;

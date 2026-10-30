@@ -63,6 +63,38 @@ async function makeReproFixture() {
 	};
 }
 
+function setFixtureCandidateStatus(fixture: { candidateId: string; store: Store }, status: string, updates: Record<string, unknown> = {}) {
+	const candidate = fixture.store.candidate(fixture.candidateId) as { data: string };
+	const data = { ...(JSON.parse(candidate.data) as Record<string, unknown>), ...updates };
+	fixture.store.setCandidateStatus(fixture.candidateId, status, data);
+	return data;
+}
+
+function makeGenuineReproModel() {
+	return {
+		async complete(_modelId: string, _system: string, prompt: string) {
+			let value;
+			if (prompt.startsWith("Write a proof-of-concept test")) {
+				value = {
+					files: [{
+						path: ".bugclaw/poc/test.js",
+						content: `require(require("path").resolve(process.cwd(), "src/main.js"));\nconsole.log("BUGCLAW_VULNERABLE");`,
+					}],
+					command: ["node", ".bugclaw/poc/test.js"],
+					rationale: "exercise src/main.js",
+				};
+			} else if (prompt.startsWith("Judge whether")) {
+				value = { verdict: "genuine", reason: "The PoC depends on the cited code." };
+			} else if (prompt.startsWith("Write the smallest fix") || prompt.startsWith("Your fix did not")) {
+				value = { files: [{ path: "src/main.js", content: "module.exports = {};\n" }], summary: "Proposed fixture fix" };
+			} else {
+				throw new Error(`unexpected prompt: ${prompt.slice(0, 40)}`);
+			}
+			return { value, inputTokens: 5, outputTokens: 7 };
+		},
+	};
+}
+
 test("Bugclaw defaults to public Nebius Token Factory models and supports overrides", () => {
 	const defaults = config({});
 	assert.equal(defaults.baseUrl, "https://api.tokenfactory.nebius.com/v1");
@@ -352,6 +384,7 @@ test("POC_RETRY renders the previous contract error", () => {
 	assert.ok(prompt.includes('SANDBOX_RESULT={"notRun":true}\nCONTRACT_ERROR="missing import"'));
 	assert.match(renderPrompt("POC", {}).prompt, /Never substitute a stub, mock, fake or hand-written replacement/);
 	assert.match(renderPrompt("POC", {}).prompt, /Return \{"cannotReproduce":/);
+	assert.match(renderPrompt("POC", {}).prompt, /Detect the vulnerable effect by its presence or by a unique marker value you choose/);
 });
 
 test("POC validation repairs escaped file text once and preserves files with real newlines", () => {
@@ -662,6 +695,109 @@ test("a final PoC validation failure terminates as invalid-poc with its contract
 		const attempts = fixture.store.attempts(fixture.candidateId) as any[];
 		assert.equal(attempts.length, 3);
 		assert.deepEqual(JSON.parse(attempts.at(-1).result), { status: "invalid", reason: "invalid PoC command" });
+	} finally { await fixture.cleanup(); }
+});
+
+test("a safe rerun records its outcome without downgrading a proven candidate", async () => {
+	const fixture = await makeReproFixture();
+	setFixtureCandidateStatus(fixture, "fix-verified");
+	let sandboxRuns = 0;
+	const sandbox = {
+		async run() {
+			sandboxRuns++;
+			return { exitCode: 0, stdout: "BUGCLAW_SAFE", stderr: "", timedOut: false };
+		},
+	};
+	try {
+		const output = await reproduce(fixture.scanId, fixture.candidateId, { store: fixture.store, model: makeGenuineReproModel(), sandbox } as any);
+		assert.equal(output[0].status, "not-reproduced");
+		assert.equal(sandboxRuns, 1);
+		const candidate = fixture.store.candidate(fixture.candidateId) as any;
+		assert.equal(candidate.status, "fix-verified");
+		const data = JSON.parse(candidate.data);
+		assert.equal(data.lastRun.status, "not-reproduced");
+		assert.equal(data.lastRun.reason, null);
+		assert.ok(Number.isFinite(Date.parse(data.lastRun.at)));
+		const attempts = fixture.store.attempts(fixture.candidateId) as any[];
+		assert.equal(attempts.length, 1);
+		assert.equal(attempts[0].step, "poc");
+		assert.equal(JSON.parse(attempts[0].result).status, "safe");
+	} finally { await fixture.cleanup(); }
+});
+
+test("a no-citations rerun records its outcome without downgrading a proven candidate", async () => {
+	const fixture = await makeReproFixture();
+	setFixtureCandidateStatus(fixture, "fix-verified", { evidence: [] });
+	let modelCalls = 0;
+	let sandboxRuns = 0;
+	const model = { async complete() { modelCalls++; throw new Error("model must not run"); } };
+	const sandbox = { async run() { sandboxRuns++; throw new Error("sandbox must not run"); } };
+	try {
+		const output = await reproduce(fixture.scanId, fixture.candidateId, { store: fixture.store, model, sandbox } as any);
+		assert.equal(output[0].status, "not-reproducible");
+		assert.equal(modelCalls, 0);
+		assert.equal(sandboxRuns, 0);
+		const candidate = fixture.store.candidate(fixture.candidateId) as any;
+		assert.equal(candidate.status, "fix-verified");
+		const data = JSON.parse(candidate.data);
+		assert.equal(data.lastRun.status, "not-reproducible");
+		assert.equal(data.lastRun.reason, "candidate has no cited source files");
+		const attempts = fixture.store.attempts(fixture.candidateId) as any[];
+		assert.equal(attempts.length, 1);
+		assert.deepEqual(JSON.parse(attempts[0].result), {
+			status: "not-reproducible",
+			reason: "candidate has no cited source files",
+		});
+	} finally { await fixture.cleanup(); }
+});
+
+test("a genuine rerun promotes a non-proven candidate", async () => {
+	const fixture = await makeReproFixture();
+	setFixtureCandidateStatus(fixture, "not-reproduced");
+	let sandboxRuns = 0;
+	const sandbox = {
+		async run() {
+			sandboxRuns++;
+			return sandboxRuns === 1
+				? { exitCode: 1, stdout: "BUGCLAW_VULNERABLE", stderr: "", timedOut: false }
+				: { exitCode: 0, stdout: "BUGCLAW_SAFE", stderr: "", timedOut: false };
+		},
+	};
+	try {
+		const output = await reproduce(fixture.scanId, fixture.candidateId, { store: fixture.store, model: makeGenuineReproModel(), sandbox } as any);
+		assert.equal(output[0].status, "fix-verified");
+		const candidate = fixture.store.candidate(fixture.candidateId) as any;
+		assert.equal(candidate.status, "fix-verified");
+		assert.equal(JSON.parse(candidate.data).reproStatus, "fix-verified");
+		assert.equal(JSON.parse(candidate.data).lastRun, undefined);
+		assert.deepEqual((fixture.store.attempts(fixture.candidateId) as any[]).map((attempt) => attempt.step), ["poc", "judge", "fix"]);
+	} finally { await fixture.cleanup(); }
+});
+
+test("a genuine fix failure can replace a previously verified fix status", async () => {
+	const fixture = await makeReproFixture();
+	setFixtureCandidateStatus(fixture, "fix-verified", {
+		lastRun: { status: "not-reproduced", reason: null, at: "2025-01-01T00:00:00.000Z" },
+	});
+	let sandboxRuns = 0;
+	const sandbox = {
+		async run() {
+			sandboxRuns++;
+			return { exitCode: 1, stdout: "BUGCLAW_VULNERABLE", stderr: "", timedOut: false };
+		},
+	};
+	try {
+		const output = await reproduce(fixture.scanId, fixture.candidateId, { store: fixture.store, model: makeGenuineReproModel(), sandbox } as any);
+		assert.equal(output[0].status, "fix-failed");
+		assert.equal(sandboxRuns, 3);
+		const candidate = fixture.store.candidate(fixture.candidateId) as any;
+		assert.equal(candidate.status, "fix-failed");
+		const data = JSON.parse(candidate.data);
+		assert.equal(data.reproStatus, "fix-failed");
+		assert.equal(data.lastRun, undefined);
+		const fixAttempts = (fixture.store.attempts(fixture.candidateId) as any[]).filter((attempt) => attempt.step === "fix");
+		assert.equal(fixAttempts.length, 2);
+		assert.ok(fixAttempts.every((attempt) => JSON.parse(attempt.result).status === "fix-failed"));
 	} finally { await fixture.cleanup(); }
 });
 
