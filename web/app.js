@@ -267,7 +267,7 @@ async function scanDetail(id, tab) {
   const tasks = act.tasks ?? [];
   const checks = tasks.filter((t) => t.stage === "hunt" || t.stage === "gapfill");
   const base = `/scans/${encodeURIComponent(id)}`;
-  const tabs = [["overview", "Overview"], ["activity", "Activity", tasks.length], ["exploration", "Exploration", checks.length], ["assets", "Assets", act.files?.length], ["findings", "Findings", cands.length]];
+  const tabs = [["overview", "Overview"], ["activity", "Activity", tasks.length], ["exploration", "Exploration", checks.length], ["assets", "Assets", act.files?.length], ["findings", "Findings", cands.length], ["report", "Report"]];
   const statusPill = s.status === "running" ? `<span class="pill a">Running</span>` : pill(s.status);
   view.innerHTML = top(scanName(s.source), { back: { href: "/scans" }, extra: `${statusPill}<span class="src" title="${esc(s.source)}">${esc(s.source)}</span><span class="meta">Started ${esc(when(s.created_at))}</span>` }) +
     `<div class="tabs">${tabs.map(([k, label, n]) => `<a href="${base}${k === "overview" ? "" : `/${k}`}" data-link class="${tab === k ? "on" : ""}">${label}${n ? `<span class="n">${n}</span>` : ""}</a>`).join("")}</div><div class="body" id="tab"></div>`;
@@ -277,6 +277,7 @@ async function scanDetail(id, tab) {
   else if (tab === "activity") activityTab(el, tasks, titles);
   else if (tab === "exploration") explorationTab(el, s, tasks, checks, titles);
   else if (tab === "assets") assetsTab(el, act.files ?? [], cands);
+  else if (tab === "report") await reportTab(el, s.id);
   else if (tab === "findings") el.innerHTML = `<div class="card"><div class="hd"><h3>Findings</h3><span class="aside">${live ? "Scan still running" : `${cands.length} candidates`}</span></div>${candidateTable(cands, { scanLive: live })}</div><p class="foot">Validator verdicts are model opinions. Only the sandbox column reflects code that actually ran, and only a person can confirm a finding.</p>`;
   else overviewTab(el, s, report, tasks, act, cands, live);
   if (live) timers.push(setInterval(async () => {
@@ -324,6 +325,7 @@ function overviewTab(el, s, report, tasks, act, cands, live) {
           <div class="quote">${esc(s.authorization)}</div>
           <dl class="kv wide" style="margin-top:20px">
             <dt>Target</dt><dd class="mono">${esc(s.source)}</dd>
+            ${report?.snapshot?.ref ? `<dt>Ref</dt><dd class="mono">${esc(report.snapshot.ref)}${report.snapshot.commit ? ` · ${esc(String(report.snapshot.commit).slice(0, 12))}` : ""}</dd>` : ""}
             <dt>Snapshot</dt><dd class="mono">${esc(s.snapshot_hash ?? "pending")}</dd>
             ${report?.models ? Object.entries(report.models).map(([k, m]) => `<dt>${esc(words(k))} model</dt><dd class="mono">${esc(m.id)}</dd>`).join("") : ""}
             <dt>Execution</dt><dd>Source-only analysis. PoCs run only in OpenShell with egress denied.</dd>
@@ -355,6 +357,17 @@ function overviewTab(el, s, report, tasks, act, cands, live) {
       </div>
     </div>
   </div>`;
+}
+
+async function reportTab(el, id) {
+  const r = await api(`/api/scans/${encodeURIComponent(id)}/report`).catch((e) => ({ error: e.message }));
+  if (r.error) { el.innerHTML = `<div class="card"><div class="pad error">${esc(r.error)}</div></div>`; return; }
+  const docs = [["Bug report", r.markdown], ["Finding detail", r.findingsDetail]].filter(([, v]) => v);
+  if (!docs.length) { el.innerHTML = `<div class="card dashed"><div class="empty"><b>No report yet</b>The engine writes its report when the scan finishes.</div></div>`; return; }
+  el.innerHTML = `<div class="card"><div class="hd"><h3>Engine report</h3><div class="seg" id="docsel">${docs.map(([n], i) => `<button data-i="${i}" class="${i ? "" : "on"}">${esc(n)}</button>`).join("")}</div></div><div class="pad"><pre id="doc" style="max-height:none"></pre></div></div>`;
+  const show = (i) => { document.getElementById("doc").textContent = docs[i][1]; el.querySelectorAll("#docsel button").forEach((b) => b.classList.toggle("on", Number(b.dataset.i) === i)); };
+  el.querySelectorAll("#docsel button").forEach((b) => b.addEventListener("click", () => show(Number(b.dataset.i))));
+  show(0);
 }
 
 function activityTab(el, tasks, titles) {
