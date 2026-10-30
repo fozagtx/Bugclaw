@@ -429,75 +429,73 @@ async function candidate(id) {
   const attempts = (c.attempts ?? []).map((a) => ({ ...a, result: parse(a.result) }));
   const signoffs = c.signoffs ?? [];
   const human = signoffs.at(-1)?.decision;
-  view.innerHTML = top(c.title, { back: { href: `/scans/${encodeURIComponent(c.scan_id)}/findings` }, extra: `${pill(c.severity)}<span class="src"></span>` }) + `
+  const last = (step, pred = () => true) => [...attempts].reverse().find((a) => a.step === step && pred(a));
+  const poc = last("poc", (a) => a.result?.evidence);
+  const judge = last("judge");
+  const fix = last("fix");
+  const proved = c.status === "reproduced" || c.status === "fix-verified" || c.status === "fix-failed";
+  const stepState = [
+    ["Found", pill(d.validation ?? d.status), d.validation === "supported" ? "Validator supports it" : d.validation === "rejected" ? "Validator rejected it" : "Waiting for validator"],
+    ["Proved", proved ? `<span class="pill r">Vulnerable</span>` : sandboxStatus(c) === "not run" ? `<span class="pill plain">Not run</span>` : pill(c.status), proved ? "PoC broke it in the sandbox" : sandboxStatus(c) === "not run" ? "Run it in OpenShell" : "Sandbox could not prove it"],
+    ["Fixed", c.status === "fix-verified" ? `<span class="pill g">Fix verified</span>` : c.status === "fix-failed" ? `<span class="pill r">Fix failed</span>` : `<span class="pill plain">—</span>`, c.status === "fix-verified" ? "Same PoC passes after the fix" : c.status === "fix-failed" ? "PoC still breaks it" : "Needs a proven PoC first"],
+    ["Signed off", human ? pill(human) : `<span class="pill plain">Waiting</span>`, human ? when(signoffs.at(-1).at) : "Only you can confirm it"],
+  ];
+  const runs = attempts.filter((a) => a.result?.evidence);
+  const tab = new URLSearchParams(location.search).get("tab") ?? "summary";
+  const tabs = [["summary", "Summary"], ["evidence", "Evidence", runs.length], ["source", "Source", (d.evidence ?? []).length], ["history", "History", attempts.length]];
+  view.innerHTML = top(c.title, { back: { href: `/scans/${encodeURIComponent(c.scan_id)}/findings` }, extra: `${pill(c.severity)}<span class="src"></span><button class="btn sm" id="repro">Run in OpenShell</button>` }) + `
+  <div class="tabs">${tabs.map(([k, l, n]) => `<a href="?tab=${k}" data-tab="${k}" class="${tab === k ? "on" : ""}">${l}${n ? `<span class="n">${n}</span>` : ""}</a>`).join("")}</div>
   <div class="body">
-    <div class="grid2">
-      <div>
-        <div class="card"><div class="hd"><h3>Claim</h3><span class="aside">${esc(words(d.attackClass))}</span></div>
-          <div class="pad"><dl class="kv wide">
-            <dt>Attacker</dt><dd>${esc(d.attacker)}</dd>
-            <dt>Root cause</dt><dd>${esc(d.rootCause)}</dd>
-            <dt>Impact</dt><dd>${esc(d.impact)}</dd>
-            <dt>Trust boundary</dt><dd>${esc(d.trustBoundary)}</dd>
-          </dl></div>
-        </div>
-        <div class="card"><div class="hd"><h3>Cited source</h3><span class="aside">${(d.evidence ?? []).length} excerpts, quoted from the snapshot</span></div>
-          <div class="pad">${(d.evidence ?? []).map((e) => `<div class="cite"><div class="path">${esc(e.path)}:${e.startLine}–${e.endLine}</div><pre>${String(e.quote ?? "").split("\n").map((l, i) => `<span class="ln">${e.startLine + i}</span>${esc(l)}`).join("\n")}</pre></div>`).join("") || `<p class="muted" style="margin:0">No citations.</p>`}</div>
-        </div>
-        <div class="card"><div class="hd"><h3>Sandbox reproduction</h3><button class="btn sm" id="repro">Run in OpenShell</button></div>
-          <div class="pad" style="padding-bottom:0"><p class="muted" id="repro-msg" style="margin:0 0 16px">Nemotron writes a PoC against the cited code. It runs in a fresh OpenShell sandbox with the network blocked, then a fix is tested against the same PoC.</p></div>
-          <ul class="runs">${attempts.length ? [...attempts].reverse().map((a) => {
-            const reason = a.result?.reason ?? a.result?.summary ?? "";
-            const rel = a.result?.evidence ? evidenceRel(a.result.evidence) : null;
-            return `<li${rel ? ` data-ev="${esc(rel)}" data-step="${esc(a.step)}"` : ""}><span class="muted mono">${esc(when(a.created_at))}</span><span class="kind">${esc(a.step)}</span><span>${pill(a.result?.status ?? a.result?.verdict ?? a.status)}${reason ? `<span class="reason" title="${esc(reason)}">${esc(reason)}</span>` : ""}</span><span class="mono muted">${rel ? "View" : ""}</span></li>`;
-          }).join("") : `<li style="display:block"><span class="muted">No sandbox runs yet.</span></li>`}</ul>
-          <div class="sec" id="evidence"><p class="muted" style="margin:0">Pick a run with evidence to see its PoC, output and replay script.</p></div>
-        </div>
-      </div>
-      <div>
-        <div class="card"><div class="hd"><h3>Status</h3></div>
-          <div class="pad"><ul class="stages">
-            <li><span>Validator <div class="muted" style="font-size:12.5px">Model opinion</div></span>${pill(d.validation ?? d.status)}</li>
-            <li><span>Sandbox <div class="muted" style="font-size:12.5px">What actually ran</div></span>${sandboxPill(c)}</li>
-            <li><span>Human <div class="muted" style="font-size:12.5px">Required to confirm</div></span>${human ? pill(human) : `<span class="pill plain">Not signed off</span>`}</li>
-          </ul>
-          ${c.data?.reproReason ? `<p class="hint">${esc(c.data.reproReason)}</p>` : ""}
-          ${d.validation === "rejected" && sandboxStatus(c) === "not run" ? `<p class="hint">The validator rejected this candidate. Validators can be wrong, so you can still test it in the sandbox.</p>` : ""}</div>
-        </div>
-        <div class="card"><div class="hd"><h3>Human signoff</h3></div>
-          <form id="signoff" class="pad" style="display:grid;gap:10px">
-            <select name="decision" required><option value="">Decision…</option><option value="confirmed">Confirm: real vulnerability</option><option value="rejected">Reject: not a vulnerability</option></select>
-            <textarea name="note" required placeholder="Why — reference the evidence you checked"></textarea>
-            <div style="display:flex;gap:10px;align-items:center"><button class="btn ghost" type="submit">Record signoff</button><span class="error" id="signoff-error"></span></div>
-          </form>
-          ${signoffs.length ? `<div class="sec"><ul class="stages">${signoffs.map((s) => `<li><span>${esc(s.note)}<div class="muted" style="font-size:12.5px">${esc(when(s.at))}</div></span>${pill(s.decision)}</li>`).join("")}</ul></div>` : `<div class="sec"><p class="muted" style="margin:0">Only a person can confirm a finding. Agents cannot.</p></div>`}
-        </div>
-      </div>
-    </div>
+    <div class="card verdict">${stepState.map(([label, p, note], i) => `<div><span class="no">0${i + 1}</span><b>${label}</b>${p}<p>${esc(note)}</p></div>`).join("")}</div>
+    <p class="muted" id="repro-msg" style="margin:-8px 0 16px"></p>
+    <div id="ctab"></div>
   </div>`;
-  const runs = view.querySelectorAll(".runs li[data-ev]");
-  runs.forEach((li) => li.addEventListener("click", () => { runs.forEach((x) => x.classList.toggle("on", x === li)); showEvidence(li.dataset.ev, li.dataset.step); }));
-  runs[0]?.click();
+  const el = document.getElementById("ctab");
+  if (tab === "evidence") {
+    el.innerHTML = runs.length ? `<div class="card"><div class="hd"><h3>Sandbox runs</h3><div class="seg" id="runsel">${[...runs].reverse().map((a, i) => `<button data-i="${i}" class="${i ? "" : "on"}">${esc(words(a.step))} · ${esc(words(a.result?.status))}</button>`).join("")}</div></div><div class="pad" id="evidence"></div></div>` : `<div class="card dashed"><div class="empty"><b>No sandbox runs yet</b>Use Run in OpenShell to generate and run a PoC.</div></div>`;
+    const ordered = [...runs].reverse();
+    el.querySelectorAll("#runsel button").forEach((b) => b.addEventListener("click", () => { el.querySelectorAll("#runsel button").forEach((x) => x.classList.toggle("on", x === b)); const a = ordered[Number(b.dataset.i)]; showEvidence(evidenceRel(a.result.evidence), a.step); }));
+    if (ordered.length) showEvidence(evidenceRel(ordered[0].result.evidence), ordered[0].step);
+  } else if (tab === "source") {
+    el.innerHTML = `<div class="card"><div class="hd"><h3>Cited source</h3><span class="aside">Quoted from the private snapshot</span></div><div class="pad">${(d.evidence ?? []).map((e) => `<div class="cite"><div class="path">${esc(e.path)}:${e.startLine}–${e.endLine}</div><pre>${String(e.quote ?? "").split("\n").map((l, i) => `<span class="ln">${e.startLine + i}</span>${esc(l)}`).join("\n")}</pre></div>`).join("") || `<p class="muted" style="margin:0">No citations.</p>`}</div></div>`;
+  } else if (tab === "history") {
+    el.innerHTML = `<div class="card">${attempts.length ? `<table><thead><tr><th>When</th><th>Step</th><th>Result</th></tr></thead><tbody>${[...attempts].reverse().map((a) => `<tr title="${esc(a.result?.reason ?? a.result?.summary ?? "")}"><td class="muted">${esc(when(a.created_at))}</td><td>${esc(words(a.step))}</td><td>${pill(a.result?.status ?? a.result?.verdict ?? a.status)}</td></tr>`).join("")}</tbody></table>` : `<div class="empty"><b>No runs yet</b>Nothing has been run for this finding.</div>`}</div><p class="foot">Hover a row to see the full reason.</p>`;
+  } else {
+    el.innerHTML = `<div class="grid2">
+      <div class="card"><div class="hd"><h3>What's wrong</h3><span class="aside">${esc(words(d.attackClass))}</span></div>
+        <div class="pad"><p class="clamp">${esc(d.rootCause)}</p>
+          <dl class="kv wide" style="margin-top:16px"><dt>Who can trigger it</dt><dd class="clamp1">${esc(d.attacker)}</dd><dt>Where</dt><dd class="mono">${esc((d.evidence ?? []).map((e) => `${e.path}:${e.startLine}`).join(", "))}</dd>${fix?.result?.summary ? `<dt>Fix</dt><dd class="clamp1">${esc(fix.result.summary)}</dd>` : ""}</dl>
+        </div></div>
+      <div class="card"><div class="hd"><h3>Your signoff</h3></div>
+        ${human ? `<div class="pad"><div style="display:flex;justify-content:space-between;gap:10px">${pill(human)}<span class="muted">${esc(when(signoffs.at(-1).at))}</span></div><p class="clamp" style="margin:12px 0 0">${esc(signoffs.at(-1).note)}</p></div>` : ""}
+        <form id="signoff" class="pad" style="display:grid;gap:10px${human ? ";border-top:1px solid var(--line)" : ""}">
+          <select name="decision" required><option value="">Decision…</option><option value="confirmed">Confirm: real vulnerability</option><option value="rejected">Reject: not a vulnerability</option></select>
+          <textarea name="note" required placeholder="What you checked"></textarea>
+          <div style="display:flex;gap:10px;align-items:center"><button class="btn ghost" type="submit">Record signoff</button><span class="error" id="signoff-error"></span></div>
+        </form>
+      </div></div>`;
+    document.getElementById("signoff").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const f = new FormData(e.target);
+      try {
+        await api(`/api/candidates/${encodeURIComponent(id)}/signoff`, { method: "POST", body: JSON.stringify({ decision: f.get("decision"), note: f.get("note") }) });
+        render();
+      } catch (err) { document.getElementById("signoff-error").textContent = err.message; }
+    });
+  }
+  view.querySelectorAll(".tabs a[data-tab]").forEach((a) => a.addEventListener("click", (e) => { e.preventDefault(); history.pushState(null, "", `${location.pathname}?tab=${a.dataset.tab}`); render(); }));
   document.getElementById("repro").addEventListener("click", async (e) => {
     e.target.disabled = true;
     const msg = document.getElementById("repro-msg");
     try {
       await api(`/api/candidates/${encodeURIComponent(id)}/reproduce`, { method: "POST" });
-      msg.textContent = "Queued. Generating a PoC with Nemotron and running it in a fresh sandbox…";
+      msg.textContent = "Running: Nemotron is writing a PoC for a fresh sandbox…";
       const before = attempts.length;
       timers.push(setInterval(async () => {
         const next = await api(`/api/candidates/${encodeURIComponent(id)}`).catch(() => null);
         if (next && next.attempts.length > before) render();
       }, 4000));
     } catch (err) { msg.textContent = err.message; e.target.disabled = false; }
-  });
-  document.getElementById("signoff").addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const f = new FormData(e.target);
-    try {
-      await api(`/api/candidates/${encodeURIComponent(id)}/signoff`, { method: "POST", body: JSON.stringify({ decision: f.get("decision"), note: f.get("note") }) });
-      render();
-    } catch (err) { document.getElementById("signoff-error").textContent = err.message; }
   });
 }
 
@@ -507,9 +505,12 @@ async function showEvidence(rel, step) {
   const get = (name) => api(`/api/evidence/${encodeURIComponent(`${rel}/${name}`)}`).then((r) => r.content).catch(() => null);
   const command = parse(await get("command.json"));
   const pocFiles = Array.isArray(command) ? command.filter((a) => String(a).startsWith(".bugclaw/")) : [];
-  const names = ["result.json", "stdout.txt", "stderr.txt", ...pocFiles, ...(step === "fix" ? ["fix.diff"] : []), "meta.json", "replay.sh"];
+  const result = parse(await get("result.json")) ?? {};
+  const names = [...pocFiles, "stdout.txt", "stderr.txt", ...(step === "fix" ? ["fix.diff"] : []), "replay.sh"];
   const loaded = (await Promise.all(names.map(async (n) => [n, await get(n)]))).filter(([, v]) => v !== null && v !== "");
-  box.innerHTML = `<div class="files">${loaded.map(([n], i) => `<button data-i="${i}">${esc(n.split("/").at(-1))}</button>`).join("")}</div><pre id="ev-body"></pre><p class="mono muted" style="margin:8px 0 0;overflow-wrap:anywhere">${esc(rel)}</p>`;
+  const label = (n) => ({ "stdout.txt": "Output", "stderr.txt": "Errors", "fix.diff": "Fix", "replay.sh": "Replay" })[n] ?? `PoC · ${n.split("/").at(-1)}`;
+  box.innerHTML = `<div class="runfacts"><span>Exit code <b>${esc(result.exitCode ?? "—")}</b></span><span>Result ${pill(result.classification)}</span><span>Network <b>blocked</b></span></div>
+    <div class="files">${loaded.map(([n], i) => `<button data-i="${i}">${esc(label(n))}</button>`).join("")}</div><pre id="ev-body"></pre>`;
   const body = document.getElementById("ev-body");
   const show = (i) => { body.textContent = loaded[i][1]; box.querySelectorAll(".files button").forEach((b) => b.classList.toggle("on", Number(b.dataset.i) === i)); };
   box.querySelectorAll(".files button").forEach((b) => b.addEventListener("click", () => show(Number(b.dataset.i))));
