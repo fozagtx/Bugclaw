@@ -19,6 +19,7 @@ export async function scan(options: { source: string; authorization: string; fil
 	store.createScan({ id, source: options.source, authorization: options.authorization });
 	try {
 		const snap = await makeSnapshot(options.source, dir, options.files);
+		store.setScan(id, "running", snap.snapshotHash);
 		const scopePath = join(dir, "scope.json");
 		const out = join(dir, "engine-output");
 		const scope = {

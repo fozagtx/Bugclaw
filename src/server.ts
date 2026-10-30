@@ -120,7 +120,8 @@ export async function serve(port = 8787, store = new Store()) {
 			}
 			if (req.method === "GET" && url.pathname.startsWith("/api/evidence/")) {
 				const path=decodeURIComponent(url.pathname.slice("/api/evidence/".length));
-				return json(res,200,{content:await readFile(evidencePath(config().dataDir,path),"utf8")});
+				try { return json(res,200,{content:await readFile(evidencePath(config().dataDir,path),"utf8")}); }
+				catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return json(res,404,{error:"evidence file not found"}); throw error; }
 			}
 			if (req.method === "GET" && url.pathname !== "/api" && !url.pathname.startsWith("/api/") && !url.pathname.startsWith("/mcp/")) {
 				const webPath = url.pathname === "/" ? "/index.html" : decodeURIComponent(url.pathname);
