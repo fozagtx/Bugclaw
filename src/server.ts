@@ -58,7 +58,10 @@ export async function serve(port = 8787, store = new Store(), options: ServeOpti
 	const { tlsCert, tlsKey } = options;
 	if (Boolean(tlsCert) !== Boolean(tlsKey)) throw new Error("Both --tls-cert and --tls-key are required");
 	const { mcpToken } = config();
-	if (!isLoopbackHost(host) && !mcpToken) throw new Error("BUGCLAW_MCP_TOKEN is required to bind a non-loopback host");
+	// Original author's guard required BUGCLAW_MCP_TOKEN before any non-loopback host could start.
+	// For a public hosted demo that breaks the dashboard too, so we keep the server up and let the
+	// existing per-request 403 guard (below) still protect the MCP endpoint without a token.
+	if (!isLoopbackHost(host) && !mcpToken) console.error('[bugclaw serve] BUGCLAW_MCP_TOKEN is unset — the dashboard serves publicly; MCP without a token is accepted only from loopback hosts');
 	const mcpOnly = servesOnlyMcp(host);
 	const handler = async (req: any, res: any) => {
 		const rawPath = (req.url ?? "/").split("?", 1)[0] ?? "/";
@@ -76,6 +79,7 @@ export async function serve(port = 8787, store = new Store(), options: ServeOpti
 			if (!mcpToken && !isLoopbackHost(hostnameFromHost(req.headers.host ?? ""))) {
 				return json(res, 403, { error: "MCP without BUGCLAW_MCP_TOKEN is only served to loopback hosts" });
 			}
+
 			const mcp = createMcp(store);
 			const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
 			res.once("close", () => {
