@@ -10,6 +10,8 @@ The Bugclaw engine in `engine/` is derived from secgin at upstream commit `01a3d
 - NVIDIA OpenShell CLI and a connected local gateway
 - `NEBIUS_API_KEY` in the process environment
 
+Bugclaw runs on the OpenShell release pinned by NemoClaw (currently 0.0.116). The runner image needs `iproute2` for OpenShell's network namespace.
+
 The default API is `https://api.tokenfactory.nebius.com/v1`. Defaults use Nemotron 3 Super for recon, hunt, and reproduction, and Nemotron 3 Ultra for validation, judgment, and fixes. `NEBIUS_BASE_URL` and the `BUGCLAW_*_MODEL` variables may override them. `BUGCLAW_DATA` selects the private data directory; `BUGCLAW_ENGINE_DIR` selects the source-discovery engine.
 
 ```sh
