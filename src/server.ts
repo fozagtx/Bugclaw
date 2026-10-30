@@ -37,6 +37,7 @@ export async function serve(port = 8787, store = new Store(), options: ServeOpti
 	if (Boolean(tlsCert) !== Boolean(tlsKey)) throw new Error("Both --tls-cert and --tls-key are required");
 	const { mcpToken } = config();
 	if (!isLoopbackHost(host) && !mcpToken) throw new Error("BUGCLAW_MCP_TOKEN is required to bind a non-loopback host");
+	const mcpOnly = servesOnlyMcp(host);
 	const mcp = new McpServer({ name: "bugclaw", version: "0.1.0" }, { capabilities: { tools: {} } });
 	mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
 	mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -62,6 +63,7 @@ export async function serve(port = 8787, store = new Store(), options: ServeOpti
 		try { decodedPath = decodeURIComponent(rawPath); } catch { return json(res, 404, { error: "not found" }); }
 		if (decodedPath.split("/").includes("..")) return json(res, 404, { error: "not found" });
 		const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "127.0.0.1"}`);
+		if (mcpOnly && url.pathname !== "/mcp") return json(res, 404, { error: "not found" });
 		if (url.pathname === "/mcp") {
 			if (mcpToken && !hasBearerToken(req.headers.authorization, mcpToken)) {
 				res.writeHead(401, { "content-type": "application/json", "www-authenticate": "Bearer" });
@@ -190,6 +192,9 @@ function isLoopbackHost(host: string) {
 	const normalized = host.toLowerCase().replace(/^\[|\]$/g, "");
 	if (normalized === "localhost" || normalized.endsWith(".localhost") || normalized === "::1") return true;
 	return isIP(normalized) === 4 && Number(normalized.split(".", 1)[0]) === 127;
+}
+function servesOnlyMcp(host: string) {
+	return !isLoopbackHost(host);
 }
 function hasBearerToken(header: unknown, token: string) {
 	if (typeof header !== "string" || !header.startsWith("Bearer ")) return false;

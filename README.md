@@ -34,4 +34,6 @@ nemoclaw <sandbox> mcp add bugclaw --url https://172.16.255.2:8443/mcp --env BUG
 
 The certificate must carry an IP SAN for `172.16.255.2`, and its CA must be supplied with `NEMOCLAW_CORPORATE_CA_BUNDLE` at onboarding.
 
+Run the dashboard separately on 127.0.0.1; the private HTTPS listener serves only /mcp.
+
 `npm run test:engine` executes the engine's own test suite. The OpenShell integration test in `npm test` skips only when the local gateway is unavailable.

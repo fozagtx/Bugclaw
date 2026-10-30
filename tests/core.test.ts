@@ -89,6 +89,7 @@ test("MCP bearer authentication and non-loopback binding require the configured 
 	const previousToken = process.env.BUGCLAW_MCP_TOKEN;
 	let store: Store | undefined;
 	let protectedService: Awaited<ReturnType<typeof serve>> | undefined;
+	let privateService: Awaited<ReturnType<typeof serve>> | undefined;
 	let unprotectedService: Awaited<ReturnType<typeof serve>> | undefined;
 	const initializeBody = JSON.stringify({
 		jsonrpc: "2.0",
@@ -124,6 +125,24 @@ test("MCP bearer authentication and non-loopback binding require the configured 
 		assert.notEqual(authorized.status, 401);
 		await authorized.text();
 
+		privateService = await serve(0, store, { host: "0.0.0.0" });
+		const privateAddress = privateService.server.address();
+		assert.ok(privateAddress && typeof privateAddress !== "string");
+		const privateHealth = await fetch(`http://127.0.0.1:${privateAddress.port}/api/health`);
+		assert.equal(privateHealth.status, 404);
+		assert.deepEqual(await privateHealth.json(), { error: "not found" });
+		const privateSignoff = await fetch(`http://127.0.0.1:${privateAddress.port}/api/candidates/x/signoff`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ decision: "confirmed", note: "test" }),
+		});
+		assert.equal(privateSignoff.status, 404);
+		assert.deepEqual(await privateSignoff.json(), { error: "not found" });
+		const privateMcp = await postInitialize(privateAddress.port, "Bearer expected-secret");
+		assert.notEqual(privateMcp.status, 404);
+		assert.notEqual(privateMcp.status, 401);
+		await privateMcp.text();
+
 		delete process.env.BUGCLAW_MCP_TOKEN;
 		await assert.rejects(
 			serve(0, store, { host: "0.0.0.0" }),
@@ -137,6 +156,7 @@ test("MCP bearer authentication and non-loopback binding require the configured 
 		await unauthenticated.text();
 	} finally {
 		if (unprotectedService) await unprotectedService.close();
+		if (privateService) await privateService.close();
 		if (protectedService) await protectedService.close();
 		store?.close();
 		if (previousData === undefined) delete process.env.BUGCLAW_DATA;
