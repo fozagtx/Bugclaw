@@ -4,8 +4,35 @@ const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 const parse = (v) => { if (typeof v !== "string") return v; try { return JSON.parse(v); } catch { return v; } };
 const short = (id) => esc(String(id ?? "").slice(0, 8));
 const when = (iso) => iso ? new Date(iso).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }) : "";
-const tag = (s) => s ? `<span class="tag ${esc(String(s).toLowerCase())}">${esc(s)}</span>` : `<span class="muted">—</span>`;
+const clock = (iso) => iso ? new Date(iso).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" }) : "";
+const ago = (iso) => {
+  if (!iso) return "";
+  const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return new Date(iso).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+};
+const words = (s) => String(s ?? "").replace(/[-_:]+/g, " ").replace(/^\w/, (c) => c.toUpperCase());
+const TONE = {
+  g: ["complete", "done", "fix-verified", "not-reproduced", "safe", "up", "confirmed", "supported", "validated", "genuine", "completed"],
+  a: ["running", "queued", "inconclusive", "needs-reproduction", "needs-context", "pending", "model-error", "sandbox-error", "not-reproducible", "medium", "tautological"],
+  r: ["failed", "incomplete", "reproduced", "fix-failed", "vulnerable", "down", "critical", "high", "invalid-poc", "invalid"],
+};
+const tone = (s) => Object.keys(TONE).find((k) => TONE[k].includes(String(s).toLowerCase())) ?? "";
+const pill = (s, label) => s ? `<span class="pill ${tone(s)}">${esc(label ?? words(s))}</span>` : `<span class="muted">—</span>`;
 const SEV = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
+const icon = (d) => `<svg class="i" viewBox="0 0 16 16">${d}</svg>`;
+const I = {
+  back: icon('<path d="M13 8H3M7 4 3 8l4 4"/>'),
+  arrow: icon('<path d="M3 8h10M9 4l4 4-4 4"/>'),
+  search: icon('<circle cx="7" cy="7" r="4.5"/><path d="m10.5 10.5 3 3"/>'),
+  folder: icon('<path d="M2 4.5h4l1.5 1.5H14v6.5H2z"/>'),
+  git: icon('<circle cx="4.5" cy="4" r="1.5"/><circle cx="4.5" cy="12" r="1.5"/><circle cx="11.5" cy="6" r="1.5"/><path d="M4.5 5.5v5M11.5 7.5c0 2-2 2.5-7 3"/>'),
+  clock: icon('<circle cx="8" cy="8" r="6"/><path d="M8 4.5V8l2.5 1.5"/>'),
+  shield: icon('<path d="M8 1.8 13.5 4v4c0 3.2-2.3 5.3-5.5 6.2C4.8 13.3 2.5 11.2 2.5 8V4z"/>'),
+  file: icon('<path d="M4 1.8h5l3 3v9.4H4z"/><path d="M9 1.8v3h3"/>'),
+};
 let timers = [];
 let streams = [];
 
@@ -15,20 +42,24 @@ async function api(path, init) {
   if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
   return body;
 }
-
 function evidenceRel(abs) {
   const i = String(abs ?? "").indexOf("/scans/");
   return i < 0 ? null : abs.slice(i + 7);
 }
+function scanName(source) {
+  const s = String(source ?? "").replace(/\.git$/, "").replace(/\/+$/, "");
+  const m = /github\.com[/:]([^/]+\/[^/]+)/.exec(s);
+  if (m) return m[1];
+  return s.split("/").filter(Boolean).slice(-2).join("/") || s;
+}
+const isGit = (v) => /^(https?:\/\/|git@)/.test(String(v).trim());
 
-const collapsed = localStorage.getItem("bugclaw.rail") === "collapsed";
-shell.classList.toggle("collapsed", collapsed);
+shell.classList.toggle("collapsed", localStorage.getItem("bugclaw.rail") === "collapsed");
 document.getElementById("collapse").addEventListener("click", () => {
   const next = !shell.classList.contains("collapsed");
   shell.classList.toggle("collapsed", next);
   localStorage.setItem("bugclaw.rail", next ? "collapsed" : "open");
 });
-
 document.addEventListener("click", (e) => {
   const row = e.target.closest("tr[data-href]");
   const link = e.target.closest("a[data-link]");
@@ -38,118 +69,169 @@ document.addEventListener("click", (e) => {
   go(href);
 });
 window.addEventListener("popstate", render);
-
 function go(href) { history.pushState(null, "", href); render(); }
-
-function cleanup() {
-  timers.forEach(clearInterval); timers = [];
-  streams.forEach((s) => s.close()); streams = [];
-}
+function cleanup() { timers.forEach(clearInterval); timers = []; streams.forEach((s) => s.close()); streams = []; }
 
 async function render() {
   cleanup();
   const path = location.pathname.replace(/\/+$/, "") || "/";
   const parts = path.split("/").filter(Boolean);
   const section = parts[0] ?? "overview";
-  document.querySelectorAll("nav a").forEach((a) => a.classList.toggle("active", a.dataset.nav === section));
+  document.querySelectorAll(".rail nav a").forEach((a) => a.classList.toggle("active", a.dataset.nav === section && !(section === "scans" && parts[1] && parts[1] !== "new")));
+  recent(parts[0] === "scans" ? parts[1] : null);
   try {
     if (path === "/") await overview();
     else if (path === "/scans") await scans();
-    else if (parts[0] === "scans" && parts[1]) await scanDetail(decodeURIComponent(parts[1]));
+    else if (path === "/scans/new") newScan();
+    else if (parts[0] === "scans" && parts[1]) await scanDetail(decodeURIComponent(parts[1]), parts[2] ?? "overview");
     else if (path === "/candidates") await findings();
     else if (parts[0] === "candidates" && parts[1]) await candidate(decodeURIComponent(parts[1]));
     else if (path === "/setup") await setup();
-    else view.innerHTML = `<p class="eyebrow">404</p><h1>Page not found</h1>`;
+    else view.innerHTML = top("Page not found") + `<div class="body"><div class="card dashed"><div class="empty"><b>Nothing here.</b>This page does not exist.</div></div></div>`;
   } catch (err) {
-    view.innerHTML = `<p class="eyebrow">Error</p><h1>Couldn't load this page</h1><p class="error">${esc(err.message)}</p>`;
+    view.innerHTML = top("Couldn't load this page") + `<div class="body"><div class="card"><div class="pad error">${esc(err.message)}</div></div></div>`;
   }
   view.focus({ preventScroll: true });
+}
+
+function top(title, { back, extra = "", crumb = false } = {}) {
+  return `<div class="top">${back ? `<a class="back${crumb ? "" : " sq"}" href="${esc(back.href)}" data-link title="Back">${I.back}${crumb ? esc(back.label) : ""}</a>` : ""}${crumb ? `<span class="crumb">${esc(title)}</span>` : `<h1>${esc(title)}</h1>`}${extra}</div>`;
+}
+
+async function recent(activeId) {
+  const box = document.getElementById("recent");
+  const list = await api("/api/scans").catch(() => null);
+  if (!list) { box.innerHTML = `<span class="muted" style="padding:6px 10px;font-size:13px">Unavailable</span>`; return; }
+  box.innerHTML = list.length ? list.slice(0, 12).map((s) => `<a href="/scans/${encodeURIComponent(s.id)}" data-link class="${s.id === activeId ? "active" : ""}" title="${esc(s.source)}"><span class="dot ${esc(s.status)}"></span><span class="nm">${esc(scanName(s.source))}</span><span class="t">${esc(new Date(s.created_at).toDateString() === new Date().toDateString() ? clock(s.created_at) : ago(s.created_at))}</span></a>`).join("") : `<span class="muted" style="padding:6px 10px;font-size:13px">No scans yet</span>`;
 }
 
 async function health() {
   const h = await api("/api/health");
   const ok = h.nebius.keyPresent && h.nebius.modelsAvailable && h.openshell && h.docker && h.engine;
-  document.getElementById("rail-health").innerHTML = ok ? `${tag("up")} Runtime ready` : `${tag("down")} Runtime not ready`;
+  document.getElementById("rail-health").innerHTML = `<b>Runtime ${pill(ok ? "up" : "down", ok ? "Ready" : "Not ready")}</b>${ok ? "Nemotron, OpenShell and Docker reachable" : `<a href="/setup" data-link>See what's missing</a>`}`;
   return h;
 }
 
-function scanRows(list) {
-  if (!list.length) return `<div class="empty"><b>No scans yet.</b>Start one from Scans with a local path or a public git URL and an authorization reference.</div>`;
-  return `<table><thead><tr><th>Scan</th><th>Source</th><th>Status</th><th>Findings</th><th>Started</th></tr></thead><tbody>${list.map((s) => `
-    <tr data-href="/scans/${encodeURIComponent(s.id)}"><td class="mono">${short(s.id)}</td><td class="mono">${esc(s.source)}</td><td>${tag(s.status)}</td><td class="mono">${s.candidateCount ?? "—"}</td><td class="muted">${when(s.created_at)}</td></tr>`).join("")}</tbody></table>`;
-}
-
-function candidateRows(list, { showScan } = {}) {
-  if (!list.length) return `<div class="empty"><b>No findings.</b>The engine reported no candidates for this scope.</div>`;
-  const sorted = [...list].sort((a, b) => (SEV[a.severity] ?? 9) - (SEV[b.severity] ?? 9));
-  return `<table><thead><tr><th>Severity</th><th>Finding</th><th>Validator</th><th>Sandbox</th>${showScan ? "<th>Scan</th>" : ""}</tr></thead><tbody>${sorted.map((c) => {
-    const d = parse(c.data) ?? {};
-    return `<tr data-href="/candidates/${encodeURIComponent(c.id)}"><td>${tag(c.severity)}</td><td class="title">${esc(c.title)}<div class="muted mono">${esc((d.evidence ?? []).map((e) => `${e.path}:${e.startLine}`).join("  "))}</div></td><td>${tag(d.validation ?? d.status)}</td><td>${tag(sandboxStatus(c))}</td>${showScan ? `<td class="mono">${short(c.scan_id)}</td>` : ""}</tr>`;
-  }).join("")}</tbody></table>`;
-}
-
-const ENGINE = new Set(["unvalidated", "rejected", "needs-reproduction", "validated", "candidate"]);
-function sandboxStatus(c) { return ENGINE.has(c.status) ? "not run" : c.status; }
-
-async function overview() {
-  const [h, list, cands] = await Promise.all([health(), api("/api/scans"), api("/api/candidates")]);
-  const cs = cands.map((c) => ({ ...c, s: sandboxStatus(c) }));
-  const count = (f) => cs.filter(f).length;
-  view.innerHTML = `
-    <p class="eyebrow"><b>01</b> Overview</p>
-    <h1>Source-only discovery, sandboxed proof, human signoff.</h1>
-    <p class="lede">Nemotron on Nebius Token Factory reads an authorized snapshot. Every candidate is tested in an OpenShell sandbox with egress denied. Nothing is confirmed until a person signs it off.</p>
-    <div class="stats" style="margin-top:36px">
-      <div class="stat"><div class="k">Scans</div><div class="v">${list.length}</div></div>
-      <div class="stat"><div class="k">Candidates</div><div class="v">${cs.length}</div></div>
-      <div class="stat"><div class="k">Reproduced</div><div class="v">${count((c) => ["reproduced", "fix-verified", "fix-failed"].includes(c.s))}<small>${count((c) => c.s === "fix-verified")} fix-verified</small></div></div>
-      <div class="stat"><div class="k">Sandboxed, not reproduced</div><div class="v">${count((c) => c.s === "not-reproduced")}</div></div>
-    </div>
-    <h2>Runtime <span>${h.nebius.keyPresent && h.openshell ? "" : "action needed"}</span></h2>
-    ${runtimeTable(h)}
-    <h2>Recent scans <span>${list.length}</span></h2>
-    ${scanRows(list.slice(0, 6))}`;
-}
-
-function runtimeTable(h) {
-  const rows = [
-    ["Nebius Token Factory", h.nebius.keyPresent && h.nebius.modelsAvailable, h.nebius.keyPresent ? (h.nebius.modelError ?? "Models reachable") : "NEBIUS_API_KEY is not set"],
+function runtimeRows(h) {
+  return [
+    ["Nebius Token Factory", h.nebius.keyPresent && h.nebius.modelsAvailable, h.nebius.keyPresent ? (h.nebius.modelError ?? "Nemotron models reachable") : "NEBIUS_API_KEY is not set"],
     ["OpenShell gateway", h.openshell, h.openshell ? "Connected" : "Run: openshell gateway start"],
     ["Docker", h.docker, h.docker ? "Daemon reachable" : "Docker daemon not reachable"],
     ["Runner image", h.runnerImage, h.runnerImage ? "Built" : "Built on first reproduction"],
     ["Discovery engine", h.engine, h.engine ? "engine/ present" : "engine/ missing"],
   ];
-  return `<table><tbody>${rows.map(([k, ok, note]) => `<tr><td style="width:240px">${esc(k)}</td><td style="width:120px">${tag(ok ? "up" : "down")}</td><td class="muted">${esc(note)}</td></tr>`).join("")}</tbody></table>`;
+}
+function runtimeTable(h) {
+  return `<table><thead><tr><th>Component</th><th style="width:140px">Status</th><th>Detail</th></tr></thead><tbody>${runtimeRows(h).map(([k, ok, note]) => `<tr><td>${esc(k)}</td><td>${pill(ok ? "up" : "down", ok ? "Up" : "Down")}</td><td class="muted">${esc(note)}</td></tr>`).join("")}</tbody></table>`;
+}
+
+const ENGINE = new Set(["unvalidated", "rejected", "needs-reproduction", "needs-context", "validated", "supported", "candidate"]);
+const sandboxStatus = (c) => ENGINE.has(c.status) ? "not run" : c.status;
+const sandboxPill = (c) => sandboxStatus(c) === "not run" ? `<span class="pill plain">Not run</span>` : pill(c.status);
+
+function scanTable(list) {
+  if (!list.length) return `<div class="empty"><b>No scans yet</b>Start one with a local path or a public git URL.</div>`;
+  return `<table><thead><tr><th>Target</th><th>Status</th><th>Findings</th><th>Started</th></tr></thead><tbody>${list.map((s) => `
+    <tr data-href="/scans/${encodeURIComponent(s.id)}"><td class="title">${esc(scanName(s.source))}<div class="sub">${esc(s.source)}</div></td><td>${pill(s.status)}</td><td>${s.candidateCount ?? "—"}</td><td class="muted">${esc(ago(s.created_at))}</td></tr>`).join("")}</tbody></table>`;
+}
+
+function candidateTable(list, { showScan, scanLive } = {}) {
+  if (!list.length) return `<div class="empty"><b>${scanLive ? "Nothing verified yet" : "No findings"}</b>${scanLive ? "Findings appear here once the validator has checked them." : "The engine reported no candidates for this scope."}</div>`;
+  const sorted = [...list].sort((a, b) => (SEV[a.severity] ?? 9) - (SEV[b.severity] ?? 9));
+  return `<table><thead><tr><th>Finding</th><th>Severity</th><th>Validator</th><th>Sandbox</th>${showScan ? "<th>Scan</th>" : ""}</tr></thead><tbody>${sorted.map((c) => {
+    const d = parse(c.data) ?? {};
+    return `<tr data-href="/candidates/${encodeURIComponent(c.id)}"><td class="title">${esc(c.title)}<div class="sub">${esc((d.evidence ?? []).map((e) => `${e.path}:${e.startLine}`).join("  "))}</div></td><td>${pill(c.severity)}</td><td>${pill(d.validation ?? d.status)}</td><td>${sandboxPill(c)}</td>${showScan ? `<td class="mono muted">${short(c.scan_id)}</td>` : ""}</tr>`;
+  }).join("")}</tbody></table>`;
+}
+
+async function overview() {
+  const [h, list, cands] = await Promise.all([health(), api("/api/scans"), api("/api/candidates")]);
+  const count = (f) => cands.filter(f).length;
+  view.innerHTML = top("Overview", { extra: `<span class="src"></span><a class="btn" href="/scans/new" data-link>New scan ${I.arrow}</a>` }) + `
+  <div class="body">
+    <div class="card"><div class="steps">
+      <div><span class="no">Scans</span><b style="font-size:28px;letter-spacing:-.02em">${list.length}</b><p>${count(() => true)} candidates found</p></div>
+      <div><span class="no">Reproduced</span><b style="font-size:28px;letter-spacing:-.02em">${count((c) => ["reproduced", "fix-verified", "fix-failed"].includes(c.status))}</b><p>PoC proved it in a sandbox</p></div>
+      <div><span class="no">Fix verified</span><b style="font-size:28px;letter-spacing:-.02em">${count((c) => c.status === "fix-verified")}</b><p>Same PoC passes after the fix</p></div>
+      <div><span class="no">Not reproduced</span><b style="font-size:28px;letter-spacing:-.02em">${count((c) => ["not-reproduced", "not-reproducible"].includes(c.status))}</b><p>Sandbox could not prove it</p></div>
+    </div></div>
+    <div class="grid2">
+      <div class="card"><div class="hd"><h3>Recent scans</h3><a class="aside" href="/scans" data-link>All scans</a></div>${scanTable(list.slice(0, 6))}</div>
+      <div class="card"><div class="hd"><h3>Runtime</h3>${pill(runtimeRows(h).every((r) => r[1] || r[0] === "Runner image") ? "up" : "down", runtimeRows(h).every((r) => r[1] || r[0] === "Runner image") ? "Ready" : "Action needed")}</div><div class="pad"><ul class="stages">${runtimeRows(h).map(([k, ok, note]) => `<li><span>${esc(k)}<div class="muted" style="font-size:12.5px">${esc(note)}</div></span>${pill(ok ? "up" : "down", ok ? "Up" : "Down")}</li>`).join("")}</ul></div></div>
+    </div>
+  </div>`;
 }
 
 async function scans() {
   const list = await api("/api/scans");
-  view.innerHTML = `
-    <p class="eyebrow"><b>02</b> Scans</p>
-    <h1>Scans</h1>
-    <p class="lede">Each scan snapshots the source, hashes every file, and runs recon, hunt and validation on Nemotron.</p>
-    <h2>New scan</h2>
-    <form class="form" id="new-scan">
-      <label for="source">Source<small>Local directory or credential-free git URL</small></label>
-      <div class="field"><input id="source" name="source" required placeholder="/path/to/repo or https://github.com/org/repo"></div>
-      <label for="authorization">Authorization<small>Who allowed this review and where it is recorded</small></label>
-      <div class="field"><input id="authorization" name="authorization" required placeholder="e.g. Owner approval, ticket SEC-142"></div>
-      <label for="files">Files<small>Optional, comma-separated</small></label>
-      <div class="field"><input id="files" name="files" placeholder="src/login.js, src/api.js"></div>
-      <label for="domains">Domains</label>
-      <div class="field"><select id="domains" name="domains"><option value="web2">web2</option><option value="web3">web3</option><option value="web2,web3">web2 + web3</option></select></div>
-      <div class="actions row"><button class="btn" type="submit">Start scan</button><span class="error" id="scan-error"></span></div>
+  view.innerHTML = top("Scans", { extra: `<span class="src"></span><a class="btn" href="/scans/new" data-link>New scan ${I.arrow}</a>` }) + `
+  <div class="body">
+    <div class="ph"><h2>All scans</h2><p>Every scan snapshots the source, hashes each file and runs recon, hunt and validation on Nemotron · ${list.length} in total</p></div>
+    <div class="card">${scanTable(list)}</div>
+  </div>`;
+}
+
+function newScan() {
+  view.innerHTML = top("New scan", { back: { href: "/scans", label: "Scans" }, crumb: true }) + `
+  <div class="body narrow">
+    <form id="new-scan">
+      <div class="card">
+        <div class="hd"><h3>What should we scan?</h3><span class="aside">Source only · runs on your Nebius key</span></div>
+        <div class="pad">
+          <div class="target">
+            <label class="box"><span id="kind-icon" class="muted">${I.folder}</span><input name="source" id="source" required autocomplete="off" placeholder="/path/to/repo or https://github.com/org/repo"><span class="pill plain" id="kind">Local path</span></label>
+            <button class="btn lg" type="submit">Start scan ${I.arrow}</button>
+          </div>
+          <p class="hint">A credential-free git URL is cloned once; a local path is copied. Bugclaw never touches a live system.</p>
+          <p class="error" id="scan-error"></p>
+        </div>
+        <div class="cols" style="border-top:1px solid var(--line)">
+          <div><p class="lbl">Covers</p><div>This snapshot only <span class="muted">· up to 200 source files</span></div></div>
+          <div><p class="lbl">Domains</p><select name="domains"><option value="web2">Web2 · apps, APIs, libraries</option><option value="web3">Web3 · smart contracts</option><option value="web2,web3">Web2 + Web3</option></select></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="hd"><h3>Authorization</h3><span class="aside">Required</span></div>
+        <div class="pad">
+          <p class="lbl">Reference <span>Who allowed this review and where it is recorded</span></p>
+          <input name="authorization" required placeholder="e.g. Owner approval in ticket SEC-142, or public package under its license">
+          <p class="hint">Stored with the scan scope and every piece of evidence.</p>
+        </div>
+      </div>
+      <div class="card">
+        <div class="hd"><h3>Options</h3><span class="aside">All optional</span></div>
+        <div class="pad">
+          <p class="lbl">Files <span>Limit the scan to these paths</span></p>
+          <input name="files" placeholder="src/login.js, src/api/users.ts">
+          <p class="hint">Comma-separated, relative to the repo root. Leave empty to let Bugclaw pick source files and skip tests, vendor and build output.</p>
+        </div>
+      </div>
+      <div class="card">
+        <div class="hd"><h3>How it works</h3></div>
+        <div class="steps">
+          <div><span class="no">01</span><b>Snapshot</b><p>Copies the source privately and hashes every file</p></div>
+          <div><span class="no">02</span><b>Hunt</b><p>Nemotron maps the code and hunts with security lenses</p></div>
+          <div><span class="no">03</span><b>Prove</b><p>Runs each PoC in an OpenShell sandbox with no network, then tests a fix</p></div>
+          <div><span class="no">04</span><b>Sign off</b><p>Evidence and replay script; only you can confirm a finding</p></div>
+        </div>
+      </div>
     </form>
-    <h2>All scans <span>${list.length}</span></h2>
-    ${scanRows(list)}`;
+  </div>`;
+  const src = document.getElementById("source");
+  src.addEventListener("input", () => {
+    const git = isGit(src.value);
+    document.getElementById("kind").textContent = git ? "Git repo" : "Local path";
+    document.getElementById("kind-icon").innerHTML = git ? I.git : I.folder;
+  });
+  src.focus();
   document.getElementById("new-scan").addEventListener("submit", async (e) => {
     e.preventDefault();
     const f = new FormData(e.target);
     const split = (v) => String(v || "").split(",").map((s) => s.trim()).filter(Boolean);
-    const btn = e.target.querySelector("button");
+    const btn = e.target.querySelector("button[type=submit]");
     btn.disabled = true;
     try {
-      const body = { source: f.get("source"), authorization: f.get("authorization"), domains: split(f.get("domains")) };
+      const body = { source: String(f.get("source")).trim(), authorization: f.get("authorization"), domains: split(f.get("domains")) };
       const files = split(f.get("files"));
       if (files.length) body.files = files;
       const { id } = await api("/api/scans", { method: "POST", body: JSON.stringify(body) });
@@ -161,51 +243,184 @@ async function scans() {
   });
 }
 
-async function scanDetail(id) {
-  const s = await api(`/api/scans/${encodeURIComponent(id)}`);
+const STAGES = [["recon", "Map the code"], ["trace", "Trace calls"], ["hunt", "Hunt"], ["validate", "Validate"], ["feedback", "Feedback"], ["gapfill", "Gap fill"], ["vvs-dedup", "Deduplicate"]];
+function stageOf(t) { return t.stage === "wishlist" ? "feedback" : t.stage; }
+function taskTitle(t, cands) {
+  const p = t.id.split(":");
+  if (t.stage === "recon") return p[1] ? `Map ${words(p[1]).toLowerCase()}` : "Combine recon";
+  if (t.stage === "hunt" || t.stage === "gapfill") return `${t.stage === "gapfill" ? "Gap fill · " : ""}${words(p[t.stage === "gapfill" ? 3 : 2] ?? t.id)} lens`;
+  if (t.stage === "validate") return `Validate · ${cands.get(p[1]) ?? p[1]?.slice(0, 12)}`;
+  if (t.stage === "trace") return "Trace call edges";
+  if (t.stage === "feedback") return "Learn from rejected findings";
+  if (t.stage === "wishlist") return "Missing context";
+  if (t.stage === "vvs-dedup") return p[0] === "vvs-dedup-agent" ? "Merge duplicates" : "Shortlist duplicates";
+  return words(t.id);
+}
+const TASKPILL = { done: ["g", "Completed"], failed: ["r", "Failed"], running: ["a", "Running"], pending: ["", "Queued"] };
+const taskPill = (s) => `<span class="pill ${TASKPILL[s]?.[0] ?? ""}">${TASKPILL[s]?.[1] ?? words(s)}</span>`;
+
+async function scanDetail(id, tab) {
+  const [s, act] = await Promise.all([api(`/api/scans/${encodeURIComponent(id)}`), api(`/api/scans/${encodeURIComponent(id)}/activity`).catch((e) => ({ error: e.message, tasks: [], files: [] }))]);
   const report = parse(s.report);
+  const cands = s.candidates ?? [];
   const live = ["queued", "running"].includes(s.status);
-  view.innerHTML = `
-    <p class="eyebrow"><a href="/scans" data-link>Scans</a> / <span class="mono">${short(s.id)}</span></p>
-    <h1>${esc(s.source)}</h1>
-    <div class="row">${tag(s.status)}<span class="muted">${when(s.created_at)}</span></div>
-    <h2>Scope</h2>
-    <dl class="kv">
-      <dt>Scan id</dt><dd class="mono">${esc(s.id)}</dd>
-      <dt>Authorization</dt><dd>${esc(s.authorization)}</dd>
-      <dt>Snapshot hash</dt><dd class="mono">${esc(s.snapshot_hash ?? "pending")}</dd>
-      ${report?.models ? `<dt>Models</dt><dd class="mono">${Object.entries(report.models).map(([k, m]) => `${esc(k)}: ${esc(m.id)}`).join("<br>")}</dd>` : ""}
-    </dl>
-    ${live ? `<h2>Live events</h2><div class="log" id="log">Waiting for engine events…</div>` : ""}
-    <h2>Findings <span>${(s.candidates ?? []).length}</span></h2>
-    ${live && !(s.candidates ?? []).length ? `<div class="empty"><b>Scan in progress.</b>Findings appear here when the engine finishes.</div>` : candidateRows(s.candidates ?? [])}`;
-  if (live) {
-    const log = document.getElementById("log");
-    const es = new EventSource(`/api/scans/${encodeURIComponent(id)}/events`);
-    streams.push(es);
-    let first = true;
-    es.onmessage = (m) => {
-      const ev = parse(m.data);
-      if (first) { log.textContent = ""; first = false; }
-      log.insertAdjacentHTML("beforeend", `<div>${esc(new Date().toLocaleTimeString())}  ${esc(ev.type ?? "event")}  ${esc(ev.message ?? ev.stage ?? "")}</div>`);
-      log.scrollTop = log.scrollHeight;
-      if (ev.type === "complete" || ev.type === "error") setTimeout(render, 800);
-    };
-    timers.push(setInterval(async () => {
-      const next = await api(`/api/scans/${encodeURIComponent(id)}`).catch(() => null);
-      if (next && !["queued", "running"].includes(next.status)) render();
-    }, 5000));
-  }
+  const tasks = act.tasks ?? [];
+  const checks = tasks.filter((t) => t.stage === "hunt" || t.stage === "gapfill");
+  const base = `/scans/${encodeURIComponent(id)}`;
+  const tabs = [["overview", "Overview"], ["activity", "Activity", tasks.length], ["exploration", "Exploration", checks.length], ["assets", "Assets", act.files?.length], ["findings", "Findings", cands.length]];
+  const statusPill = s.status === "running" ? `<span class="pill a">Running</span>` : pill(s.status);
+  view.innerHTML = top(scanName(s.source), { back: { href: "/scans" }, extra: `${statusPill}<span class="src" title="${esc(s.source)}">${esc(s.source)}</span><span class="meta">Started ${esc(when(s.created_at))}</span>` }) +
+    `<div class="tabs">${tabs.map(([k, label, n]) => `<a href="${base}${k === "overview" ? "" : `/${k}`}" data-link class="${tab === k ? "on" : ""}">${label}${n ? `<span class="n">${n}</span>` : ""}</a>`).join("")}</div><div class="body" id="tab"></div>`;
+  const el = document.getElementById("tab");
+  const titles = new Map(cands.map((c) => [c.id, c.title]));
+  if (act.error && tab !== "overview" && tab !== "findings") el.innerHTML = `<div class="card"><div class="pad error">Engine activity unavailable: ${esc(act.error)}</div></div>`;
+  else if (tab === "activity") activityTab(el, tasks, titles);
+  else if (tab === "exploration") explorationTab(el, s, tasks, checks, titles);
+  else if (tab === "assets") assetsTab(el, act.files ?? [], cands);
+  else if (tab === "findings") el.innerHTML = `<div class="card"><div class="hd"><h3>Findings</h3><span class="aside">${live ? "Scan still running" : `${cands.length} candidates`}</span></div>${candidateTable(cands, { scanLive: live })}</div><p class="foot">Validator verdicts are model opinions. Only the sandbox column reflects code that actually ran, and only a person can confirm a finding.</p>`;
+  else overviewTab(el, s, report, tasks, act, cands, live);
+  if (live) timers.push(setInterval(async () => {
+    if (location.pathname.startsWith(base)) render();
+  }, 8000));
+}
+
+function overviewTab(el, s, report, tasks, act, cands, live) {
+  const done = tasks.filter((t) => t.status === "done").length;
+  const failed = tasks.filter((t) => t.status === "failed");
+  const pct = tasks.length ? Math.round((done / tasks.length) * 100) : 0;
+  const C = 2 * Math.PI * 50;
+  const hunts = tasks.filter((t) => t.stage === "hunt");
+  const vals = tasks.filter((t) => t.stage === "validate");
+  const tokens = tasks.reduce((a, t) => [a[0] + (t.inputTokens ?? 0), a[1] + (t.outputTokens ?? 0)], [0, 0]);
+  const cited = new Set(cands.flatMap((c) => ((parse(c.data) ?? {}).evidence ?? []).map((e) => e.path)));
+  const meter = (label, n, total, g) => `<div class="meter"><div class="top2">${esc(label)}<span>${n} / ${total}</span></div><div class="track"><i class="${g ? "g" : ""}" style="width:${total ? Math.round((n / total) * 100) : 0}%"></i></div></div>`;
+  const callout = live
+    ? `<div class="card"><div class="pad callout"><span class="ic">${I.clock}</span><div><h3>Scan running</h3><p>${tasks.length ? `${done} of ${tasks.length} engine steps finished. This page refreshes on its own.` : "Snapshotting the source and starting recon."}</p></div></div></div>`
+    : s.status === "incomplete" || s.status === "failed"
+      ? `<div class="card"><div class="pad callout"><span class="ic">${I.shield}</span><div><h3>Scan ${esc(s.status)}</h3><p>${failed.length} engine step${failed.length === 1 ? "" : "s"} failed (${esc([...new Set(failed.map((t) => t.error).filter(Boolean))].join(", ") || "see Activity")}). The findings it validated before that are still listed.</p></div></div></div>`
+      : "";
+  const byStage = STAGES.map(([k, label]) => {
+    const ts = tasks.filter((t) => stageOf(t) === k);
+    if (!ts.length) return "";
+    const st = ts.some((t) => t.status === "running") ? "running" : ts.some((t) => t.status === "pending") ? "pending" : ts.every((t) => t.status === "done") ? "done" : ts.some((t) => t.status === "done") ? "done" : "failed";
+    return `<li><span>${esc(label)} <span class="muted">· ${ts.filter((t) => t.status === "done").length}/${ts.length}</span></span>${taskPill(st)}</li>`;
+  }).join("");
+  el.innerHTML = `${callout}
+  <div class="grid2">
+    <div>
+      <div class="card"><div class="hd"><h3>Coverage</h3><span class="aside">From the engine's own task log</span></div>
+        <div class="pad cov">
+          <div class="ring"><svg viewBox="0 0 120 120"><circle cx="60" cy="60" r="50" fill="none" stroke="#eef0f3" stroke-width="12"/><circle cx="60" cy="60" r="50" fill="none" stroke="${failed.length && !live ? "#9a6100" : "#1f7a45"}" stroke-width="12" stroke-linecap="round" stroke-dasharray="${(C * pct) / 100} ${C}"/></svg><div class="v">${pct}%</div></div>
+          <div>
+            ${meter("Hunt lenses finished", hunts.filter((t) => t.status === "done").length, hunts.length, true)}
+            ${meter("Candidates validated", vals.filter((t) => t.status === "done").length, vals.length, true)}
+            ${meter("Files cited by findings", cited.size, act.files?.length ?? 0)}
+          </div>
+        </div>
+      </div>
+      <div class="card"><div class="hd"><h3>Scan plan</h3>${pill(s.status === "complete" ? "done" : s.status, s.status === "complete" ? "Done" : undefined)}</div>
+        <div class="pad">
+          <p class="lbl">Authorization</p>
+          <div class="quote">${esc(s.authorization)}</div>
+          <dl class="kv wide" style="margin-top:20px">
+            <dt>Target</dt><dd class="mono">${esc(s.source)}</dd>
+            <dt>Snapshot</dt><dd class="mono">${esc(s.snapshot_hash ?? "pending")}</dd>
+            ${report?.models ? Object.entries(report.models).map(([k, m]) => `<dt>${esc(words(k))} model</dt><dd class="mono">${esc(m.id)}</dd>`).join("") : ""}
+            <dt>Execution</dt><dd>Source-only analysis. PoCs run only in OpenShell with egress denied.</dd>
+          </dl>
+        </div>
+      </div>
+    </div>
+    <div>
+      <div class="card"><div class="hd"><h3>Summary</h3></div>
+        <div class="pad">
+          <p class="lbl">Findings</p>
+          <dl class="kv">
+            <dt>Candidates</dt><dd>${cands.length}</dd>
+            <dt>Reproduced</dt><dd>${cands.filter((c) => ["reproduced", "fix-verified", "fix-failed"].includes(c.status)).length}</dd>
+            <dt>Fix verified</dt><dd>${cands.filter((c) => c.status === "fix-verified").length}</dd>
+          </dl>
+          <a class="btn ghost sm" style="margin-top:14px" href="/scans/${encodeURIComponent(s.id)}/findings" data-link>${I.file} Open findings</a>
+        </div>
+        <div class="sec"><p class="lbl">Progress <span>${done} of ${tasks.length}</span></p>${byStage ? `<ul class="stages">${byStage}</ul>` : `<p class="muted" style="margin:0">No engine steps yet.</p>`}</div>
+        <div class="sec"><p class="lbl">Scan details</p>
+          <dl class="kv">
+            <dt>Scan id</dt><dd class="mono">${short(s.id)}</dd>
+            <dt>Files</dt><dd>${act.files?.length ?? "—"}</dd>
+            <dt>Tokens in</dt><dd>${tokens[0].toLocaleString()}</dd>
+            <dt>Tokens out</dt><dd>${tokens[1].toLocaleString()}</dd>
+            <dt>Started</dt><dd>${esc(when(s.created_at))}</dd>
+          </dl>
+        </div>
+      </div>
+    </div>
+  </div>`;
+}
+
+function activityTab(el, tasks, titles) {
+  const types = [["all", "All"], ["recon", "Recon"], ["hunt", "Hunts"], ["validate", "Validation"], ["other", "Other"]];
+  const typeOf = (t) => t.stage === "recon" || t.stage === "trace" ? "recon" : t.stage === "hunt" || t.stage === "gapfill" ? "hunt" : t.stage === "validate" ? "validate" : "other";
+  let filter = "all", q = "", order = "new";
+  el.innerHTML = `<div class="ph"><h2>Activity</h2><p>Every step the engine recorded · ${tasks.length} in total</p></div>
+    <div class="bar"><div class="seg" id="types">${types.map(([k, l]) => `<button data-k="${k}" class="${k === "all" ? "on" : ""}">${l} <span class="c">${k === "all" ? tasks.length : tasks.filter((t) => typeOf(t) === k).length}</span></button>`).join("")}</div></div>
+    <div class="bar"><label class="search">${I.search}<input id="q" placeholder="Search steps and results"></label><div class="seg" id="order"><button data-k="new" class="on">Newest first</button><button data-k="old">Oldest first</button></div></div>
+    <div class="card" id="list"></div><p class="foot" id="count"></p>`;
+  const draw = () => {
+    let rows = tasks.map((t, i) => ({ ...t, i })).filter((t) => (filter === "all" || typeOf(t) === filter) && (!q || `${taskTitle(t, titles)} ${t.summary ?? ""} ${t.error ?? ""}`.toLowerCase().includes(q)));
+    if (order === "new") rows = rows.reverse();
+    document.getElementById("list").innerHTML = rows.length ? `<table><thead><tr><th style="width:60px">Step</th><th style="width:120px">Type</th><th>Entry</th><th style="width:120px">Status</th><th style="width:130px">Tokens</th></tr></thead><tbody>${rows.map((t) => `<tr><td class="mono muted">${t.i + 1}</td><td><span class="pill plain">${esc(words(typeOf(t) === "other" ? stageOf(t) : typeOf(t)))}</span></td><td><div style="font-weight:500">${esc(taskTitle(t, titles))}</div>${t.summary || t.error ? `<div class="muted" style="font-size:13.5px;margin-top:3px">${esc(t.error ? words(t.error) : t.summary)}</div>` : ""}${t.findings ? `<div class="mono" style="margin-top:6px">Led to ${t.findings} candidate${t.findings === 1 ? "" : "s"}</div>` : ""}${t.verdict ? `<div style="margin-top:6px">${pill(t.verdict)}</div>` : ""}</td><td>${taskPill(t.status)}</td><td class="mono muted">${t.inputTokens != null ? `${t.inputTokens.toLocaleString()} / ${(t.outputTokens ?? 0).toLocaleString()}` : "—"}</td></tr>`).join("")}</tbody></table>` : `<div class="empty"><b>No steps</b>${tasks.length ? "Nothing matches this filter." : "The engine has not recorded any steps yet."}</div>`;
+    document.getElementById("count").textContent = `${rows.length} step${rows.length === 1 ? "" : "s"}`;
+  };
+  el.querySelectorAll("#types button").forEach((b) => b.addEventListener("click", () => { filter = b.dataset.k; el.querySelectorAll("#types button").forEach((x) => x.classList.toggle("on", x === b)); draw(); }));
+  el.querySelectorAll("#order button").forEach((b) => b.addEventListener("click", () => { order = b.dataset.k; el.querySelectorAll("#order button").forEach((x) => x.classList.toggle("on", x === b)); draw(); }));
+  document.getElementById("q").addEventListener("input", (e) => { q = e.target.value.toLowerCase(); draw(); });
+  draw();
+}
+
+function explorationTab(el, s, tasks, checks, titles) {
+  const recon = tasks.find((t) => t.id === "recon") ?? tasks.find((t) => t.stage === "recon");
+  const vals = tasks.filter((t) => t.stage === "validate");
+  const extra = tasks.filter((t) => t.stage === "feedback" || t.stage === "wishlist");
+  const st = (t) => t.status === "done" ? "done" : t.status;
+  const check = (t, kind) => `<div class="check"><span class="st ${st(t)}"></span>
+      <div class="hd2"><span class="kind">${kind}</span>${taskPill(t.status)}${t.verdict ? pill(t.verdict) : ""}</div>
+      <p class="ttl">${esc(taskTitle(t, titles))}</p>
+      ${t.status === "failed" ? `<div class="result bad"><p class="lbl">Result</p><p>Step failed: ${esc(words(t.error ?? "unknown error"))}</p></div>` : t.summary && t.summary !== t.id ? `<div class="result"><p class="lbl">Result</p><p>${esc(t.summary)}</p></div>` : ""}
+      ${t.findings ? `<ul class="sub-obs"><li>Led to ${t.findings} candidate${t.findings === 1 ? "" : "s"} for validation</li></ul>` : ""}
+    </div>`;
+  el.innerHTML = `<div class="card"><div class="hd"><h3>Exploration paths</h3><span class="aside">${checks.length} checks · ${vals.length} validations</span></div>
+    <div class="tree">
+      <div class="goal"><span class="pill ${tasks.some((t) => t.status === "running" || t.status === "pending") ? "a" : "g"} plain">Goal</span><div><div style="font-weight:500">Find exploitable vulnerabilities in ${esc(scanName(s.source))}, from source only</div>${recon?.summary ? `<div class="muted" style="margin-top:4px">${esc(recon.summary)}</div>` : ""}</div></div>
+      ${checks.length ? checks.map((t) => check(t, "Check")).join("") : `<div class="empty"><b>No checks yet</b>Hunt lenses appear here once recon finishes.</div>`}
+      ${vals.length ? `<p class="lbl" style="margin-top:28px">Validation</p>${vals.map((t) => check(t, "Validate")).join("")}` : ""}
+      ${extra.length ? `<p class="lbl" style="margin-top:28px">What the engine learned</p>${extra.map((t) => check(t, t.stage === "wishlist" ? "Missing context" : "Feedback")).join("")}` : ""}
+    </div></div>`;
+}
+
+function assetsTab(el, files, cands) {
+  const cites = new Map();
+  for (const c of cands) for (const e of (parse(c.data) ?? {}).evidence ?? []) cites.set(e.path, (cites.get(e.path) ?? 0) + 1);
+  let filter = "all", q = "";
+  el.innerHTML = `<div class="ph"><h2>Assets</h2><p>Every file in the private snapshot · ${files.length} in total</p></div>
+    <div class="bar"><div class="seg"><button class="on">${I.file} Files <span class="c">${files.length}</span></button></div></div>
+    <div class="bar"><label class="search">${I.search}<input id="q" placeholder="Search files by path"></label><div class="seg" id="f"><button data-k="all" class="on">All</button><button data-k="cited">Cited</button><button data-k="none">Not cited</button></div></div>
+    <div class="card" id="list"></div><p class="foot" id="count"></p>`;
+  const draw = () => {
+    const rows = files.filter((f) => (filter === "all" || (filter === "cited") === cites.has(f.path)) && (!q || f.path.toLowerCase().includes(q)));
+    document.getElementById("list").innerHTML = rows.length ? `<table><thead><tr><th>File</th><th style="width:190px">Findings</th><th style="width:170px">Source</th><th style="width:150px">SHA-256</th></tr></thead><tbody>${rows.map((f) => `<tr><td class="mono" style="font-size:13.5px;color:var(--ink)">${esc(f.path)}</td><td>${cites.has(f.path) ? `<span class="pill r">Cited by ${cites.get(f.path)}</span>` : `<span class="pill plain">None</span>`}</td><td><span class="pill plain">Snapshot</span></td><td class="mono muted" title="${esc(f.sha256)}">${esc(f.sha256.slice(0, 12))}</td></tr>`).join("")}</tbody></table>` : `<div class="empty"><b>No files</b>${files.length ? "Nothing matches this filter." : "The snapshot has not been written yet."}</div>`;
+    document.getElementById("count").textContent = `${rows.length} file${rows.length === 1 ? "" : "s"}`;
+  };
+  el.querySelectorAll("#f button").forEach((b) => b.addEventListener("click", () => { filter = b.dataset.k; el.querySelectorAll("#f button").forEach((x) => x.classList.toggle("on", x === b)); draw(); }));
+  document.getElementById("q").addEventListener("input", (e) => { q = e.target.value.toLowerCase(); draw(); });
+  draw();
 }
 
 async function findings() {
   const cands = await api("/api/candidates");
-  view.innerHTML = `
-    <p class="eyebrow"><b>03</b> Findings</p>
-    <h1>Findings</h1>
-    <p class="lede">Candidates from every scan. Validator verdicts are model opinions; the sandbox column is what actually ran.</p>
-    <h2>All candidates <span>${cands.length}</span></h2>
-    ${candidateRows(cands, { showScan: true })}`;
+  view.innerHTML = top("Findings") + `<div class="body">
+    <div class="ph"><h2>All findings</h2><p>Candidates from every scan · ${cands.length} in total</p></div>
+    <div class="card">${candidateTable(cands, { showScan: true })}</div>
+    <p class="foot">Validator verdicts are model opinions. Only the sandbox column reflects code that actually ran, and only a person can confirm a finding.</p></div>`;
 }
 
 async function candidate(id) {
@@ -213,50 +428,56 @@ async function candidate(id) {
   const d = c.data ?? {};
   const attempts = (c.attempts ?? []).map((a) => ({ ...a, result: parse(a.result) }));
   const signoffs = c.signoffs ?? [];
-  const runs = attempts.filter((a) => a.result?.evidence);
-  view.innerHTML = `
-    <p class="eyebrow"><a href="/scans/${encodeURIComponent(c.scan_id)}" data-link>Scan ${short(c.scan_id)}</a> / Finding</p>
-    <h1>${esc(c.title)}</h1>
-    <div class="row">${tag(c.severity)}<span class="muted">Validator</span>${tag(d.validation ?? d.status)}<span class="muted">Sandbox</span>${tag(sandboxStatus(c))}${signoffs.length ? `<span class="muted">Human</span>${tag(signoffs.at(-1).decision)}` : ""}</div>
-    ${d.validation === "rejected" && sandboxStatus(c) === "not run" ? `<div class="notice">The validator rejected this candidate. Validators can be wrong, so Bugclaw still lets you test it in the sandbox.</div>` : ""}
-    <div class="split">
+  const human = signoffs.at(-1)?.decision;
+  view.innerHTML = top(c.title, { back: { href: `/scans/${encodeURIComponent(c.scan_id)}/findings` }, extra: `${pill(c.severity)}<span class="src"></span>` }) + `
+  <div class="body">
+    <div class="grid2">
       <div>
-        <h2>Claim</h2>
-        <dl class="kv">
-          <dt>Attacker</dt><dd>${esc(d.attacker)}</dd>
-          <dt>Root cause</dt><dd>${esc(d.rootCause)}</dd>
-          <dt>Impact</dt><dd>${esc(d.impact)}</dd>
-          <dt>Trust boundary</dt><dd>${esc(d.trustBoundary)}</dd>
-          <dt>Class</dt><dd>${esc(d.attackClass)}</dd>
-        </dl>
+        <div class="card"><div class="hd"><h3>Claim</h3><span class="aside">${esc(words(d.attackClass))}</span></div>
+          <div class="pad"><dl class="kv wide">
+            <dt>Attacker</dt><dd>${esc(d.attacker)}</dd>
+            <dt>Root cause</dt><dd>${esc(d.rootCause)}</dd>
+            <dt>Impact</dt><dd>${esc(d.impact)}</dd>
+            <dt>Trust boundary</dt><dd>${esc(d.trustBoundary)}</dd>
+          </dl></div>
+        </div>
+        <div class="card"><div class="hd"><h3>Cited source</h3><span class="aside">${(d.evidence ?? []).length} excerpts, quoted from the snapshot</span></div>
+          <div class="pad">${(d.evidence ?? []).map((e) => `<div class="cite"><div class="path">${esc(e.path)}:${e.startLine}–${e.endLine}</div><pre>${String(e.quote ?? "").split("\n").map((l, i) => `<span class="ln">${e.startLine + i}</span>${esc(l)}`).join("\n")}</pre></div>`).join("") || `<p class="muted" style="margin:0">No citations.</p>`}</div>
+        </div>
+        <div class="card"><div class="hd"><h3>Sandbox reproduction</h3><button class="btn sm" id="repro">Run in OpenShell</button></div>
+          <div class="pad" style="padding-bottom:0"><p class="muted" id="repro-msg" style="margin:0 0 16px">Nemotron writes a PoC against the cited code. It runs in a fresh OpenShell sandbox with the network blocked, then a fix is tested against the same PoC.</p></div>
+          <ul class="runs">${attempts.length ? [...attempts].reverse().map((a) => {
+            const reason = a.result?.reason ?? a.result?.summary ?? "";
+            const rel = a.result?.evidence ? evidenceRel(a.result.evidence) : null;
+            return `<li${rel ? ` data-ev="${esc(rel)}" data-step="${esc(a.step)}"` : ""}><span class="muted mono">${esc(when(a.created_at))}</span><span class="kind">${esc(a.step)}</span><span>${pill(a.result?.status ?? a.result?.verdict ?? a.status)}${reason ? `<span class="reason" title="${esc(reason)}">${esc(reason)}</span>` : ""}</span><span class="mono muted">${rel ? "View" : ""}</span></li>`;
+          }).join("") : `<li style="display:block"><span class="muted">No sandbox runs yet.</span></li>`}</ul>
+          <div class="sec" id="evidence"><p class="muted" style="margin:0">Pick a run with evidence to see its PoC, output and replay script.</p></div>
+        </div>
       </div>
       <div>
-        <h2>Cited source <span>${(d.evidence ?? []).length}</span></h2>
-        ${(d.evidence ?? []).map((e) => `<div class="cite"><div class="path">${esc(e.path)}:${e.startLine}–${e.endLine}</div><pre>${String(e.quote ?? "").split("\n").map((l, i) => `<span class="ln">${e.startLine + i}</span>${esc(l)}`).join("\n")}</pre></div>`).join("")}
+        <div class="card"><div class="hd"><h3>Status</h3></div>
+          <div class="pad"><ul class="stages">
+            <li><span>Validator <div class="muted" style="font-size:12.5px">Model opinion</div></span>${pill(d.validation ?? d.status)}</li>
+            <li><span>Sandbox <div class="muted" style="font-size:12.5px">What actually ran</div></span>${sandboxPill(c)}</li>
+            <li><span>Human <div class="muted" style="font-size:12.5px">Required to confirm</div></span>${human ? pill(human) : `<span class="pill plain">Not signed off</span>`}</li>
+          </ul>
+          ${c.data?.reproReason ? `<p class="hint">${esc(c.data.reproReason)}</p>` : ""}
+          ${d.validation === "rejected" && sandboxStatus(c) === "not run" ? `<p class="hint">The validator rejected this candidate. Validators can be wrong, so you can still test it in the sandbox.</p>` : ""}</div>
+        </div>
+        <div class="card"><div class="hd"><h3>Human signoff</h3></div>
+          <form id="signoff" class="pad" style="display:grid;gap:10px">
+            <select name="decision" required><option value="">Decision…</option><option value="confirmed">Confirm: real vulnerability</option><option value="rejected">Reject: not a vulnerability</option></select>
+            <textarea name="note" required placeholder="Why — reference the evidence you checked"></textarea>
+            <div style="display:flex;gap:10px;align-items:center"><button class="btn ghost" type="submit">Record signoff</button><span class="error" id="signoff-error"></span></div>
+          </form>
+          ${signoffs.length ? `<div class="sec"><ul class="stages">${signoffs.map((s) => `<li><span>${esc(s.note)}<div class="muted" style="font-size:12.5px">${esc(when(s.at))}</div></span>${pill(s.decision)}</li>`).join("")}</ul></div>` : `<div class="sec"><p class="muted" style="margin:0">Only a person can confirm a finding. Agents cannot.</p></div>`}
+        </div>
       </div>
     </div>
-    <h2>Sandbox reproduction <span>${attempts.length} attempts</span></h2>
-    <div class="row" style="padding:16px 0"><button class="btn" id="repro">Run in OpenShell</button><span class="muted" id="repro-msg">Egress denied. The generated PoC runs only inside a fresh sandbox, then a fix is tested against the same PoC.</span></div>
-    <div class="split">
-      <ul class="timeline">${attempts.length ? [...attempts].reverse().map((a) => {
-        const reason = a.result?.reason ?? a.result?.summary ?? "";
-        const rel = a.result?.evidence ? evidenceRel(a.result.evidence) : null;
-        return `<li${rel ? ` data-ev="${esc(rel)}"` : ""}><span class="muted mono">${esc(when(a.created_at))}</span><span class="mono">${esc(a.step)}</span><span>${tag(a.result?.status ?? a.result?.verdict ?? a.status)}${reason ? `<span class="reason" title="${esc(reason)}">${esc(reason)}</span>` : ""}</span><span class="mono muted">${rel ? "view" : ""}</span></li>`;
-      }).join("") : `<li><span class="muted">No sandbox runs yet.</span></li>`}</ul>
-      <div id="evidence"><div class="empty"><b>No evidence selected.</b>Pick a sandbox run to see its PoC, output and replay script.</div></div>
-    </div>
-    <h2>Human signoff</h2>
-    <div class="split">
-      <form id="signoff" style="padding-top:16px;display:grid;gap:10px">
-        <select name="decision" required><option value="">Decision…</option><option value="confirmed">Confirm: this is a real vulnerability</option><option value="rejected">Reject: not a vulnerability</option></select>
-        <textarea name="note" required placeholder="Why — reference the evidence you checked"></textarea>
-        <div class="row"><button class="btn ghost" type="submit">Record signoff</button><span class="error" id="signoff-error"></span></div>
-      </form>
-      <div>${signoffs.length ? signoffs.map((s) => `<div class="row" style="padding:12px 0;border-bottom:1px solid var(--line)">${tag(s.decision)}<span>${esc(s.note)}</span><span class="muted">${when(s.at)}</span></div>`).join("") : `<div class="empty"><b>Not signed off.</b>Only a person can confirm a finding. Agents cannot.</div>`}</div>
-    </div>
-    </div>`;
-  view.querySelectorAll("li[data-ev]").forEach((li) => li.addEventListener("click", () => { view.querySelectorAll("li[data-ev]").forEach((x) => x.classList.toggle("on", x === li)); showEvidence(li.dataset.ev); }));
-  if (runs.length) view.querySelector("li[data-ev]")?.click();
+  </div>`;
+  const runs = view.querySelectorAll(".runs li[data-ev]");
+  runs.forEach((li) => li.addEventListener("click", () => { runs.forEach((x) => x.classList.toggle("on", x === li)); showEvidence(li.dataset.ev, li.dataset.step); }));
+  runs[0]?.click();
   document.getElementById("repro").addEventListener("click", async (e) => {
     e.target.disabled = true;
     const msg = document.getElementById("repro-msg");
@@ -280,15 +501,15 @@ async function candidate(id) {
   });
 }
 
-async function showEvidence(rel) {
+async function showEvidence(rel, step) {
   const box = document.getElementById("evidence");
   if (!box || !rel) return;
   const get = (name) => api(`/api/evidence/${encodeURIComponent(`${rel}/${name}`)}`).then((r) => r.content).catch(() => null);
   const command = parse(await get("command.json"));
   const pocFiles = Array.isArray(command) ? command.filter((a) => String(a).startsWith(".bugclaw/")) : [];
-  const names = ["result.json", "stdout.txt", "stderr.txt", ...pocFiles, "fix.diff", "meta.json", "replay.sh"];
+  const names = ["result.json", "stdout.txt", "stderr.txt", ...pocFiles, ...(step === "fix" ? ["fix.diff"] : []), "meta.json", "replay.sh"];
   const loaded = (await Promise.all(names.map(async (n) => [n, await get(n)]))).filter(([, v]) => v !== null && v !== "");
-  box.innerHTML = `<div class="files">${loaded.map(([n], i) => `<button data-i="${i}" class="${i ? "" : "on"}">${esc(n.split("/").at(-1))}</button>`).join("")}</div><pre id="ev-body"></pre><p class="muted mono" style="margin-top:8px">${esc(rel)}</p>`;
+  box.innerHTML = `<div class="files">${loaded.map(([n], i) => `<button data-i="${i}">${esc(n.split("/").at(-1))}</button>`).join("")}</div><pre id="ev-body"></pre><p class="mono muted" style="margin:8px 0 0;overflow-wrap:anywhere">${esc(rel)}</p>`;
   const body = document.getElementById("ev-body");
   const show = (i) => { body.textContent = loaded[i][1]; box.querySelectorAll(".files button").forEach((b) => b.classList.toggle("on", Number(b.dataset.i) === i)); };
   box.querySelectorAll(".files button").forEach((b) => b.addEventListener("click", () => show(Number(b.dataset.i))));
@@ -297,25 +518,22 @@ async function showEvidence(rel) {
 
 async function setup() {
   const h = await health();
-  view.innerHTML = `
-    <p class="eyebrow"><b>04</b> Setup</p>
-    <h1>Setup</h1>
-    <p class="lede">Bugclaw needs a Nebius Token Factory key and a running OpenShell gateway. Nothing ever runs on the host.</p>
-    <h2>Runtime</h2>
-    ${runtimeTable(h)}
-    <h2>Environment</h2>
-    <dl class="kv">
-      <dt>NEBIUS_API_KEY</dt><dd>Required. Token Factory → API keys.</dd>
-      <dt>NEBIUS_BASE_URL</dt><dd class="mono">Optional. Default https://api.tokenfactory.nebius.com/v1</dd>
-      <dt>BUGCLAW_DATA</dt><dd class="mono">Optional. Default ./data (private, 0700)</dd>
-    </dl>
-    <h2>Agents</h2>
-    <dl class="kv">
-      <dt>MCP endpoint</dt><dd class="mono">${esc(location.origin)}/mcp</dd>
-      <dt>Tools</dt><dd class="mono">bugclaw_scan, bugclaw_status, bugclaw_candidates, bugclaw_reproduce, bugclaw_evidence</dd>
-      <dt>Signoff</dt><dd>Human-only, from this dashboard or the HTTP API. Not exposed to agents.</dd>
-    </dl>`;
+  view.innerHTML = top("Setup") + `<div class="body">
+    <div class="ph"><h2>Runtime</h2><p>Bugclaw needs a Nebius Token Factory key and a running OpenShell gateway. Nothing ever runs on the host.</p></div>
+    <div class="card">${runtimeTable(h)}</div>
+    <div class="grid2" style="grid-template-columns:1fr 1fr">
+      <div class="card"><div class="hd"><h3>Environment</h3></div><div class="pad"><dl class="kv wide">
+        <dt class="mono">NEBIUS_API_KEY</dt><dd>Required. Token Factory → API keys.</dd>
+        <dt class="mono">NEBIUS_BASE_URL</dt><dd>Optional. Default <span class="mono">https://api.tokenfactory.nebius.com/v1</span></dd>
+        <dt class="mono">BUGCLAW_DATA</dt><dd>Optional. Default <span class="mono">./data</span>, private (0700)</dd>
+      </dl></div></div>
+      <div class="card"><div class="hd"><h3>Agents (MCP)</h3></div><div class="pad"><dl class="kv wide">
+        <dt>Endpoint</dt><dd class="mono">${esc(location.origin)}/mcp</dd>
+        <dt>Tools</dt><dd class="mono">bugclaw_scan, bugclaw_status, bugclaw_candidates, bugclaw_reproduce, bugclaw_evidence</dd>
+        <dt>Signoff</dt><dd>Human-only, from this dashboard or the HTTP API. Not exposed to agents.</dd>
+      </dl></div></div>
+    </div></div>`;
 }
 
-health().catch(() => { document.getElementById("rail-health").textContent = "Runtime unknown"; });
+health().catch(() => { document.getElementById("rail-health").innerHTML = "<b>Runtime</b>Unknown"; });
 render();
