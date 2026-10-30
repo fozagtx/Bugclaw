@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, link, lstat, mkdir, mkdtemp, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, mkdtemp, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test, { after } from "node:test";
@@ -14,7 +14,7 @@ after(async () => {
 });
 
 async function directory(): Promise<string> {
-	const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "bugclaw-store-"));
+	const temporaryDirectory = await mkdtemp(path.join(await realpath(os.tmpdir()), "bugclaw-store-"));
 	temporaryDirectories.push(temporaryDirectory);
 	return temporaryDirectory;
 }

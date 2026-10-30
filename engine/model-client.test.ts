@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -461,7 +461,7 @@ test("SECURITY_HARNESS_MODELS extends the catalog and skips unknown providers", 
 });
 
 test("agent provider lists coding agents only when BUGCLAW_AGENT_DIR is set", () => {
-	const dir = mkdtempSync(join(tmpdir(), "bugclaw-agent-"));
+	const dir = mkdtempSync(join(realpathSync(tmpdir()), "bugclaw-agent-"));
 	try {
 		const without = new ProviderClient({ env: {}, readFile: () => undefined });
 		assert.ok(!without.listModels().some((entry) => entry.provider === "agent"));

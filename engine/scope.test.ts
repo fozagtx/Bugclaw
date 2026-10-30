@@ -42,7 +42,7 @@ function configWithLimit(limit: keyof HarnessConfig["limits"], value: number): R
 }
 
 async function fixture(): Promise<string> {
-	const directory = await mkdtemp(path.join(os.tmpdir(), "bugclaw-"));
+	const directory = await mkdtemp(path.join(await realpath(os.tmpdir()), "bugclaw-"));
 	await mkdir(path.join(directory, "src"));
 	await writeFile(path.join(directory, "src", "app.ts"), "export const answer = 42;\n");
 	return directory;

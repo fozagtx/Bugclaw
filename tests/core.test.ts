@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { access, cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
@@ -800,8 +801,12 @@ test("HTTP dashboard and detail APIs use temporary data and serve SPA routes saf
 	}
 });
 
-test("findingReport uses the real persisted candidate and evidence rows", async () => {
-	const liveData = "/home/ubuntu/repos/Bugclaw/data";
+test("findingReport uses the real persisted candidate and evidence rows", async t => {
+	const liveData = join(process.cwd(), "data");
+	if (!existsSync(join(liveData, "bugclaw.sqlite"))) {
+		t.skip("This test reads a locally persisted data/ database created by a real scan; it does not ship with the repository.");
+		return;
+	}
 	const candidateId = "480457e3967ba72abd6e1029-dcd5c2e3972426ef";
 	const scanId = "319e6ca2-e3c9-4661-9381-8fd9dba066b4";
 	const live = new DatabaseSync(join(liveData, "bugclaw.sqlite"), { readOnly: true });

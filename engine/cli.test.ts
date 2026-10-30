@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -91,7 +91,7 @@ function writeRemoteScope(directory: string, maxCalls = 400): string {
 }
 
 test("CLI plans the operator's scope and evaluates a report the operator supplies", () => {
-	const temporary = mkdtempSync(join(tmpdir(), "security-cli-"));
+	const temporary = mkdtempSync(join(realpathSync(tmpdir()), "security-cli-"));
 	try {
 		const scope = writeAuthorizedScope(temporary);
 		const preview = invoke("plan", scope);
@@ -218,7 +218,7 @@ test("CLI plans the operator's scope and evaluates a report the operator supplie
 });
 
 test("CLI refuses missing consent and never echoes a malformed config's private payload", () => {
-	const temporary = mkdtempSync(join(tmpdir(), "security-cli-"));
+	const temporary = mkdtempSync(join(realpathSync(tmpdir()), "security-cli-"));
 	try {
 		const sourceDir = join(temporary, "src");
 		mkdirSync(sourceDir);
@@ -241,7 +241,7 @@ test("CLI refuses missing consent and never echoes a malformed config's private 
 });
 
 test("CLI surfaces invalid configuration reasons", () => {
-	const temporary = mkdtempSync(join(tmpdir(), "security-cli-"));
+	const temporary = mkdtempSync(join(realpathSync(tmpdir()), "security-cli-"));
 	try {
 		const scope = writeRemoteScope(temporary, 0);
 		const result = invoke("plan", scope);
@@ -253,9 +253,9 @@ test("CLI surfaces invalid configuration reasons", () => {
 });
 
 test("CLI surfaces missing model credentials", () => {
-	const temporary = mkdtempSync(join(tmpdir(), "security-cli-"));
-	const home = mkdtempSync(join(tmpdir(), "security-cli-home-"));
-	const output = mkdtempSync(join(tmpdir(), "security-cli-output-"));
+	const temporary = mkdtempSync(join(realpathSync(tmpdir()), "security-cli-"));
+	const home = mkdtempSync(join(realpathSync(tmpdir()), "security-cli-home-"));
+	const output = mkdtempSync(join(realpathSync(tmpdir()), "security-cli-output-"));
 	try {
 		const scope = writeRemoteScope(temporary);
 		const env = { ...process.env };
@@ -280,7 +280,7 @@ test("CLI surfaces missing model credentials", () => {
 });
 
 test("CLI surfaces missing scope files", () => {
-	const temporary = mkdtempSync(join(tmpdir(), "security-cli-"));
+	const temporary = mkdtempSync(join(realpathSync(tmpdir()), "security-cli-"));
 	try {
 		const missing = join(temporary, "missing-scope.json");
 		const result = invoke("plan", missing);

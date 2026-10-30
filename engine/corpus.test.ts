@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -27,7 +27,7 @@ function row(uid: string, leaf: string, severity: string, title: string, body: s
 }
 
 function corpus(rows: unknown[]): string {
-	const dir = mkdtempSync(join(tmpdir(), "bugclaw-corpus-"));
+	const dir = mkdtempSync(join(realpathSync(tmpdir()), "bugclaw-corpus-"));
 	writeFileSync(join(dir, "findings.jsonl.gz"), gzipSync(rows.map((entry) => JSON.stringify(entry)).join("\n") + "\n"));
 	writeFileSync(join(dir, "SYNCED"), "test\n");
 	return dir;
