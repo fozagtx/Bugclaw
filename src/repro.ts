@@ -37,6 +37,10 @@ export function classify(result: { exitCode: number; timedOut: boolean; stdout: 
 	return "inconclusive";
 }
 
+export function shouldAttemptFix(options: { fix?: boolean }) {
+	return options.fix === true;
+}
+
 function repairEscapedContent(content: string): { content: string; repaired?: "unescaped-newlines" } {
 	if (content.includes("\n") || !content.includes("\\n")) return { content };
 	return {
@@ -99,7 +103,7 @@ export function validateFixFiles(value: unknown, citedFiles: string[]) {
 	return { files, repaired };
 }
 
-export async function reproduce(scanId: string, candidateId?: string, services: { store?: Store; model?: NebiusClient; sandbox?: Sandbox } = {}) {
+export async function reproduce(scanId: string, candidateId?: string, services: { store?: Store; model?: NebiusClient; sandbox?: Sandbox; fix?: boolean } = {}) {
 	const store = services.store ?? new Store();
 	const model = services.model ?? new NebiusClient();
 	const sandbox = services.sandbox ?? new Sandbox();
@@ -228,71 +232,73 @@ export async function reproduce(scanId: string, candidateId?: string, services: 
 			else {
 				status = "reproduced";
 				terminalReason = undefined;
-				let fixed = false;
-				let previousFix: unknown = null;
-				let previousFixRun: Awaited<ReturnType<Sandbox["run"]>> | undefined;
-				for (let attempt = 0; attempt < 2; attempt++) {
-					const fixStarted = new Date().toISOString();
-					const prompt = renderPrompt(attempt ? "FIX_RETRY" : "FIX", {
-						CANDIDATE_JSON: raw, POC_JSON: poc, PREVIOUS_FIX_JSON: previousFix,
-						SANDBOX_RESULT: previousFixRun ? {
-							exitCode: previousFixRun.exitCode,
-							stdoutTail: tail(previousFixRun.stdout),
-							stderrTail: tail(previousFixRun.stderr),
-							timedOut: previousFixRun.timedOut,
-						} : { notRun: true },
-						CITED_FILES_FULL: sourceData,
-					});
-					const proposal = await model.complete(cfg.models.fix, prompt.system, prompt.prompt, OUTPUT_SCHEMAS[attempt ? "FIX_RETRY" : "FIX"]);
-					previousFix = proposal.value;
-					const fixDetails = {
-						summary: proposal.value.summary,
-						modelId: cfg.models.fix,
-						tokens: { input: proposal.inputTokens, output: proposal.outputTokens },
-					};
-					let fixFiles: Array<{ path: string; content: string }>;
-					let fixRepair: "unescaped-newlines" | undefined;
-					try {
-						const validated = validateFixFiles(proposal.value.files, files);
-						fixFiles = validated.files;
-						fixRepair = validated.repaired;
-					}
-					catch {
-						store.attempt(row.id, "fix", { status: "fix-failed", reason: "fix changes files outside cited source", ...fixDetails });
-						break;
-					}
-					const patched = await mkdtempForFix();
-					try {
-						await copySnapshot(snapshot, patched);
-						for (const file of fixFiles) {
-							const target = resolve(patched, file.path);
-							if (!target.startsWith(`${patched}${sep}`)) throw new Error("Unsafe fix path");
-							await mkdir(dirname(target), { recursive: true });
-							await writeFile(target, file.content);
-						}
-						let result: Awaited<ReturnType<Sandbox["run"]>>;
+				if (shouldAttemptFix(services)) {
+					let fixed = false;
+					let previousFix: unknown = null;
+					let previousFixRun: Awaited<ReturnType<Sandbox["run"]>> | undefined;
+					for (let attempt = 0; attempt < 2; attempt++) {
+						const fixStarted = new Date().toISOString();
+						const prompt = renderPrompt(attempt ? "FIX_RETRY" : "FIX", {
+							CANDIDATE_JSON: raw, POC_JSON: poc, PREVIOUS_FIX_JSON: previousFix,
+							SANDBOX_RESULT: previousFixRun ? {
+								exitCode: previousFixRun.exitCode,
+								stdoutTail: tail(previousFixRun.stdout),
+								stderrTail: tail(previousFixRun.stderr),
+								timedOut: previousFixRun.timedOut,
+							} : { notRun: true },
+							CITED_FILES_FULL: sourceData,
+						});
+						const proposal = await model.complete(cfg.models.fix, prompt.system, prompt.prompt, OUTPUT_SCHEMAS[attempt ? "FIX_RETRY" : "FIX"]);
+						previousFix = proposal.value;
+						const fixDetails = {
+							summary: proposal.value.summary,
+							modelId: cfg.models.fix,
+							tokens: { input: proposal.inputTokens, output: proposal.outputTokens },
+						};
+						let fixFiles: Array<{ path: string; content: string }>;
+						let fixRepair: "unescaped-newlines" | undefined;
 						try {
-							result = await sandbox.run(patched, poc.files, poc.command, 120);
-						} catch (error) {
-							if (!(error instanceof SandboxError)) throw error;
-							store.attempt(row.id, "fix", { status: "sandbox-error", reason: error.message, ...fixDetails });
-							status = "sandbox-error";
+							const validated = validateFixFiles(proposal.value.files, files);
+							fixFiles = validated.files;
+							fixRepair = validated.repaired;
+						}
+						catch {
+							store.attempt(row.id, "fix", { status: "fix-failed", reason: "fix changes files outside cited source", ...fixDetails });
 							break;
 						}
-						previousFixRun = result;
-						const diff = await getDiff(snapshot, patched);
-						const classification = classify(result);
-						await writeEvidence({
-							dataDir: cfg.dataDir, scanId, candidateId: row.id, runId, step: "fix", number: attempt + 1, files: [...poc.files, ...fixFiles], argv: poc.command, run: result,
-							meta: { snapshotHash: (store.scan(scanId) as any)?.snapshot_hash, ...result, modelId: cfg.models.fix, tokens: { input: proposal.inputTokens, output: proposal.outputTokens }, classification, ...(pocRepair || fixRepair ? { repaired: "unescaped-newlines" } : {}), startedAt: fixStarted, endedAt: new Date().toISOString() },
-							fixDiff: diff,
-						});
-						fixed = classification === "safe";
-						store.attempt(row.id, "fix", { status: fixed ? "fix-verified" : "fix-failed", ...fixDetails });
-						if (fixed) break;
-					} finally { await rm(patched, { recursive: true, force: true }); }
+						const patched = await mkdtempForFix();
+						try {
+							await copySnapshot(snapshot, patched);
+							for (const file of fixFiles) {
+								const target = resolve(patched, file.path);
+								if (!target.startsWith(`${patched}${sep}`)) throw new Error("Unsafe fix path");
+								await mkdir(dirname(target), { recursive: true });
+								await writeFile(target, file.content);
+							}
+							let result: Awaited<ReturnType<Sandbox["run"]>>;
+							try {
+								result = await sandbox.run(patched, poc.files, poc.command, 120);
+							} catch (error) {
+								if (!(error instanceof SandboxError)) throw error;
+								store.attempt(row.id, "fix", { status: "sandbox-error", reason: error.message, ...fixDetails });
+								status = "sandbox-error";
+								break;
+							}
+							previousFixRun = result;
+							const diff = await getDiff(snapshot, patched);
+							const classification = classify(result);
+							const evidence = await writeEvidence({
+								dataDir: cfg.dataDir, scanId, candidateId: row.id, runId, step: "fix", number: attempt + 1, files: [...poc.files, ...fixFiles], argv: poc.command, run: result,
+								meta: { snapshotHash: (store.scan(scanId) as any)?.snapshot_hash, ...result, modelId: cfg.models.fix, tokens: { input: proposal.inputTokens, output: proposal.outputTokens }, classification, ...(pocRepair || fixRepair ? { repaired: "unescaped-newlines" } : {}), startedAt: fixStarted, endedAt: new Date().toISOString() },
+								fixDiff: diff,
+							});
+							fixed = classification === "safe";
+							store.attempt(row.id, "fix", { status: fixed ? "fix-verified" : "fix-failed", evidence, ...fixDetails });
+							if (fixed) break;
+						} finally { await rm(patched, { recursive: true, force: true }); }
+					}
+					if (status !== "sandbox-error") status = fixed ? "fix-verified" : "fix-failed";
 				}
-				if (status !== "sandbox-error") status = fixed ? "fix-verified" : "fix-failed";
 			}
 		}
 		saveReproOutcome(store, row, raw, status, terminalReason);

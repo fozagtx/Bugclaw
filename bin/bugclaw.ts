@@ -10,7 +10,12 @@ async function main() {
 		if(!source||!authorization)throw new Error('Usage: bugclaw scan <path|git-url> --auth "<reference>" [--files a,b] [--domains web2]');
 		console.log(JSON.stringify(await scan({source,authorization,files,domains}),null,2));return;
 	}
-	if(command==="reproduce"){if(!args[0])throw new Error("Usage: bugclaw reproduce <scanId> [--candidate id]");const i=args.indexOf("--candidate");console.log(JSON.stringify(await reproduce(args[0],i>=0?args[i+1]:undefined),null,2));return;}
+	if(command==="reproduce"){
+		if(!args[0])throw new Error("Usage: bugclaw reproduce <scanId> [--candidate id] [--fix]");
+		const i=args.indexOf("--candidate");
+		console.log(JSON.stringify(await reproduce(args[0],i>=0?args[i+1]:undefined,{fix:args.includes("--fix")}),null,2));
+		return;
+	}
 	if (command === "serve") {
 		let port = 8787;
 		let host = "127.0.0.1";

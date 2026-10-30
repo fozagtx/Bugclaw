@@ -18,6 +18,7 @@ import { Store } from "./store.ts";
 import { evidencePath } from "./evidence.ts";
 import { runnerImageTag } from "./sandbox.ts";
 import { EngineStateBusyError, scanActivity } from "./activity.ts";
+import { findingReport } from "./report.ts";
 
 const exec = promisify(execFile);
 const events = new Map<string, EventEmitter>();
@@ -27,7 +28,7 @@ const tools = [
 	{ name: "bugclaw_scan", description: `Scan only an authorized local source snapshot. ${signoffDescription}`, inputSchema: { type: "object", properties: { source: {type:"string"}, authorization: {type:"string"}, files: {type:"array",items:{type:"string"}}, domains:{type:"array",items:{type:"string"}} }, required:["source","authorization"] } },
 	{ name: "bugclaw_status", description: `Get scan status and summary. ${signoffDescription}`, inputSchema: {type:"object",properties:{scanId:{type:"string"}},required:["scanId"]} },
 	{ name: "bugclaw_candidates", description: `List candidates; candidate statuses are not human confirmation. ${signoffDescription}`, inputSchema: {type:"object",properties:{scanId:{type:"string"}},required:["scanId"]} },
-	{ name: "bugclaw_reproduce", description: `Reproduce a candidate only inside a network-denied OpenShell sandbox; never claim confirmed. ${signoffDescription}`, inputSchema: {type:"object",properties:{scanId:{type:"string"},candidateId:{type:"string"}},required:["scanId"]} },
+	{ name: "bugclaw_reproduce", description: `Reproduce a candidate only inside a network-denied OpenShell sandbox; never claim confirmed. ${signoffDescription}`, inputSchema: {type:"object",properties:{scanId:{type:"string"},candidateId:{type:"string"},fix:{type:"boolean",description:"also generate and verify a fix; off by default"}},required:["scanId"]} },
 	{ name: "bugclaw_evidence", description: `Read replayable evidence stored inside Bugclaw's data directory. ${signoffDescription}`, inputSchema: {type:"object",properties:{path:{type:"string"}},required:["path"]} },
 ];
 
@@ -42,7 +43,7 @@ function createMcp(store: Store) {
 			result = await scan({ source: args.source, authorization: args.authorization, files: args.files, domains: args.domains }, store);
 		} else if (name === "bugclaw_status") result = store.scan(args.scanId);
 		else if (name === "bugclaw_candidates") result = store.candidates(args.scanId);
-		else if (name === "bugclaw_reproduce") result = await reproduce(args.scanId, args.candidateId, { store });
+		else if (name === "bugclaw_reproduce") result = await reproduce(args.scanId, args.candidateId, { store, fix: args.fix === true });
 		else if (name === "bugclaw_evidence") {
 			const path = evidencePath(config().dataDir, args.path);
 			result = await readFile(path, "utf8");
@@ -134,7 +135,18 @@ export async function serve(port = 8787, store = new Store(), options: ServeOpti
 					readOptional(join(output,"report.md")),
 					readOptional(join(output,"FINDINGS-DETAIL.md")),
 				]);
-				return json(res,200,{markdown,findingsDetail});
+				const findings = await Promise.all((store.candidates(scanId) as any[]).map(async (candidate) => ({
+					candidateId: candidate.id,
+					title: candidate.title,
+					markdown: await findingReport(store, candidate.id),
+				})));
+				return json(res,200,{markdown,findingsDetail,findings});
+			}
+			const candidateReport = /^\/api\/candidates\/([^/]+)\/report$/.exec(url.pathname);
+			if (req.method === "GET" && candidateReport) {
+				const candidateId = decodeURIComponent(candidateReport[1]!);
+				if (!store.candidate(candidateId)) return json(res,404,{error:"candidate not found"});
+				return json(res,200,{markdown:await findingReport(store,candidateId)});
 			}
 			const detail = /^\/api\/scans\/([^/]+)$/.exec(url.pathname);
 			if (req.method === "GET" && detail) {
@@ -156,7 +168,7 @@ export async function serve(port = 8787, store = new Store(), options: ServeOpti
 			if (req.method === "POST" && reproduceRoute) {
 				const row=store.candidate(decodeURIComponent(reproduceRoute[1]!));
 				if (!row) return json(res,404,{error:"candidate not found"});
-				void reproduce(row.scan_id,row.id,{store}).catch((error)=>store.attempt(row.id,"reproduce",{status:"failed",reason:error instanceof Error?error.message:"reproduction failed"}));
+				void reproduce(row.scan_id,row.id,{store,fix:false}).catch((error)=>store.attempt(row.id,"reproduce",{status:"failed",reason:error instanceof Error?error.message:"reproduction failed"}));
 				return json(res,202,{candidateId:row.id,status:"queued"});
 			}
 			const signoff = /^\/api\/candidates\/([^/]+)\/signoff$/.exec(url.pathname);

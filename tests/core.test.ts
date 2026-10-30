@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { tmpdir } from "node:os";
@@ -12,8 +12,9 @@ import { Sandbox } from "../src/sandbox.ts";
 import { firstJson, NebiusClient, parseChatResponse } from "../src/nebius.ts";
 import { OUTPUT_SCHEMAS, renderPrompt } from "../src/prompts.ts";
 import { makeSnapshot, parseGitSource } from "../src/snapshot.ts";
-import { classify, reproduce, validateFixFiles, validatePoc } from "../src/repro.ts";
+import { classify, reproduce, shouldAttemptFix, validateFixFiles, validatePoc } from "../src/repro.ts";
 import { evidencePath, writeEvidence } from "../src/evidence.ts";
+import { findingReport } from "../src/report.ts";
 import { Store } from "../src/store.ts";
 import { config } from "../src/config.ts";
 import { serve } from "../src/server.ts";
@@ -189,6 +190,8 @@ test("MCP bearer authentication and non-loopback binding require the configured 
 			"bugclaw_evidence",
 		]);
 		assert.equal(toolNames.some((name: string) => /signoff/i.test(name)), false);
+		const reproduceTool = listedResult.result.tools.find((tool: { name: string }) => tool.name === "bugclaw_reproduce");
+		assert.equal(reproduceTool.inputSchema.properties.fix.description, "also generate and verify a fix; off by default");
 
 		privateService = await serve(0, store, { host: "0.0.0.0" });
 		const privateAddress = privateService.server.address();
@@ -640,13 +643,20 @@ test("HTTP dashboard and detail APIs use temporary data and serve SPA routes saf
 
 		const reportResponse = await fetch(`${base}/api/scans/scan/report`);
 		assert.equal(reportResponse.status, 200);
-		assert.deepEqual(await reportResponse.json(), {
-			markdown: "# Scan report\nA reviewable result.\n",
-			findingsDetail: "## Findings\nOne finding.\n",
-		});
+		const report = await reportResponse.json() as any;
+		assert.equal(report.markdown, "# Scan report\nA reviewable result.\n");
+		assert.equal(report.findingsDetail, "## Findings\nOne finding.\n");
+		assert.deepEqual(report.findings.map((finding: any) => ({ candidateId: finding.candidateId, title: finding.title })), [{ candidateId: "candidate", title: "source candidate" }]);
+		assert.match(report.findings[0].markdown, /No PoC has been run/);
+		const candidateReport = await fetch(`${base}/api/candidates/candidate/report`);
+		assert.equal(candidateReport.status, 200);
+		assert.match((await candidateReport.json()).markdown, /No PoC has been run/);
+		const unknownCandidateReport = await fetch(`${base}/api/candidates/missing/report`);
+		assert.equal(unknownCandidateReport.status, 404);
+		assert.deepEqual(await unknownCandidateReport.json(), { error: "candidate not found" });
 		const emptyReportResponse = await fetch(`${base}/api/scans/empty/report`);
 		assert.equal(emptyReportResponse.status, 200);
-		assert.deepEqual(await emptyReportResponse.json(), { markdown: null, findingsDetail: null });
+		assert.deepEqual(await emptyReportResponse.json(), { markdown: null, findingsDetail: null, findings: [] });
 
 		const activityResponse = await fetch(`${base}/api/scans/scan/activity`);
 		assert.equal(activityResponse.status, 200);
@@ -690,6 +700,64 @@ test("HTTP dashboard and detail APIs use temporary data and serve SPA routes saf
 		else process.env.BUGCLAW_DATA = previousData;
 		await rm(root, { recursive: true, force: true });
 	}
+});
+
+test("findingReport uses the real persisted candidate and evidence rows", async () => {
+	const liveData = "/home/ubuntu/repos/Bugclaw/data";
+	const candidateId = "480457e3967ba72abd6e1029-dcd5c2e3972426ef";
+	const scanId = "319e6ca2-e3c9-4661-9381-8fd9dba066b4";
+	const live = new DatabaseSync(join(liveData, "bugclaw.sqlite"), { readOnly: true });
+	const candidate = live.prepare("SELECT * FROM candidates WHERE id=?").get(candidateId) as any;
+	const scan = live.prepare("SELECT * FROM scans WHERE id=?").get(scanId) as any;
+	const attempts = live.prepare("SELECT * FROM attempts WHERE candidate_id=? ORDER BY created_at").all(candidateId) as any[];
+	assert.ok(candidate);
+	assert.ok(scan);
+	assert.ok(attempts.length);
+	const root = await mkdtemp(join(tmpdir(), "bugclaw-report-"));
+	const previousData = process.env.BUGCLAW_DATA;
+	process.env.BUGCLAW_DATA = join(root, "data");
+	let store: Store | undefined;
+	try {
+		store = new Store(join(process.env.BUGCLAW_DATA, "bugclaw.sqlite"));
+		store.createScan({ id: scan.id, source: scan.source, authorization: scan.authorization });
+		store.setScan(scan.id, scan.status, scan.snapshot_hash, JSON.parse(scan.report));
+		const candidateData = JSON.parse(candidate.data);
+		store.putCandidate(scan.id, candidateData);
+		store.setCandidateStatus(candidate.id, candidate.status, candidateData);
+		for (const attempt of attempts) {
+			const result = JSON.parse(attempt.result);
+			if (typeof result.evidence === "string") {
+				const relativeEvidence = result.evidence.slice(`${liveData}/`.length);
+				const copiedEvidence = join(process.env.BUGCLAW_DATA, relativeEvidence);
+				await cp(result.evidence, copiedEvidence, { recursive: true });
+				result.evidence = copiedEvidence;
+			}
+			store.attempt(candidateId, attempt.step, result);
+		}
+		const report = await findingReport(store, candidateId);
+		assert.match(report, /Object\.prototype/);
+		assert.match(report, /node/);
+		assert.match(report, /\.bugclaw\/poc\/test\.js/);
+		assert.match(report, /Exit code: 1/);
+		assert.match(report, /network_policies: \{\}/);
+		assert.match(report, /sh replay\.sh/);
+		assert.match(report, /creates a fresh sandbox/);
+		assert.match(report, /The test uses the actual parser/);
+		assert.match(report, /awaiting human confirmation/);
+		assert.doesNotMatch(report, /confirmed vulnerability/i);
+	} finally {
+		store?.close();
+		live.close();
+		if (previousData === undefined) delete process.env.BUGCLAW_DATA;
+		else process.env.BUGCLAW_DATA = previousData;
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("reproduce defaults to no fix", () => {
+	assert.equal(shouldAttemptFix({}), false);
+	assert.equal(shouldAttemptFix({ fix: false }), false);
+	assert.equal(shouldAttemptFix({ fix: true }), true);
 });
 
 test("cannotReproduce ends without running a sandbox or writing evidence", async () => {
@@ -863,7 +931,7 @@ test("a genuine rerun promotes a non-proven candidate", async () => {
 		},
 	};
 	try {
-		const output = await reproduce(fixture.scanId, fixture.candidateId, { store: fixture.store, model: makeGenuineReproModel(), sandbox } as any);
+		const output = await reproduce(fixture.scanId, fixture.candidateId, { store: fixture.store, model: makeGenuineReproModel(), sandbox, fix: true } as any);
 		assert.equal(output[0].status, "fix-verified");
 		const candidate = fixture.store.candidate(fixture.candidateId) as any;
 		assert.equal(candidate.status, "fix-verified");
@@ -886,7 +954,7 @@ test("a genuine fix failure can replace a previously verified fix status", async
 		},
 	};
 	try {
-		const output = await reproduce(fixture.scanId, fixture.candidateId, { store: fixture.store, model: makeGenuineReproModel(), sandbox } as any);
+		const output = await reproduce(fixture.scanId, fixture.candidateId, { store: fixture.store, model: makeGenuineReproModel(), sandbox, fix: true } as any);
 		assert.equal(output[0].status, "fix-failed");
 		assert.equal(sandboxRuns, 3);
 		const candidate = fixture.store.candidate(fixture.candidateId) as any;
@@ -920,7 +988,7 @@ test("reproduction supplies sandbox output to judge and fix-retry prompts", asyn
 		},
 	};
 	try {
-		const output = await reproduce(fixture.scanId, fixture.candidateId, { store: fixture.store, model, sandbox } as any);
+		const output = await reproduce(fixture.scanId, fixture.candidateId, { store: fixture.store, model, sandbox, fix: true } as any);
 		assert.equal(output[0].status, "fix-verified");
 		assert.ok(judgePrompt.includes(pocStdout));
 		assert.ok(fixRetryPrompt.includes(`SANDBOX_RESULT=${JSON.stringify({

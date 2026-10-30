@@ -372,8 +372,7 @@ async function reportTab(el, s, cands) {
   });
   const proven = rows.filter(({ c }) => ["reproduced", "fix-verified", "fix-failed"].includes(c.status)).length;
   const fixed = rows.filter(({ c }) => c.status === "fix-verified").length;
-  const md = [`# Bugclaw report: ${s.source}`, "", `Scan ${s.id}`, "", `${rows.length} findings, ${proven} proven in an OpenShell sandbox, ${fixed} fix verified.`, "",
-    ...rows.flatMap(({ c, d, fix, where, human }) => [`## ${c.title}`, "", `- Severity: ${c.severity}`, `- Where: ${where || "-"}`, `- Validator: ${words(d.validation ?? d.status ?? "-")}`, `- Sandbox: ${words(sandboxStatus(c))}`, `- Human signoff: ${human ?? "waiting"}`, "", d.rootCause ?? "", "", fix ? `Fix: ${fix}` : "", ""])].join("\n");
+  const md = [engine?.markdown, ...(engine?.findings ?? []).map((finding) => finding.markdown)].filter(Boolean).join("\n\n");
   el.innerHTML = `<div class="card"><div class="hd"><h3>Bug report</h3><div style="display:flex;gap:10px;align-items:center"><span class="aside">${rows.length} findings · ${proven} proven · ${fixed} fix verified</span><button class="btn ghost" id="dl" style="height:32px">Download .md</button></div></div>
     ${rows.length ? rows.map(({ c, d, fix, where, human }) => `<div class="pad" style="border-top:1px solid var(--line)">
       <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">${pill(c.severity)}<a href="/candidates/${encodeURIComponent(c.id)}" data-link style="font:700 17px/1.25 var(--display);letter-spacing:-.02em;color:var(--ink);text-decoration:none">${esc(c.title)}</a></div>
@@ -465,13 +464,13 @@ async function candidate(id) {
   const stepState = [
     ["Found", pill(d.validation ?? d.status), d.validation === "supported" ? "Validator supports it" : d.validation === "rejected" ? "Validator rejected it" : "Waiting for validator"],
     ["Proved", proved ? `<span class="pill r">Vulnerable</span>` : sandboxStatus(c) === "not run" ? `<span class="pill plain">Not run</span>` : pill(c.status), proved ? "PoC broke it in the sandbox" : sandboxStatus(c) === "not run" ? "Run it in OpenShell" : "Sandbox could not prove it"],
-    ["Fixed", c.status === "fix-verified" ? `<span class="pill g">Fix verified</span>` : c.status === "fix-failed" ? `<span class="pill r">Fix failed</span>` : `<span class="pill plain">—</span>`, c.status === "fix-verified" ? "Same PoC passes after the fix" : c.status === "fix-failed" ? "PoC still breaks it" : "Needs a proven PoC first"],
+    fix ? ["Fixed", c.status === "fix-verified" ? `<span class="pill g">Fix verified</span>` : c.status === "fix-failed" ? `<span class="pill r">Fix failed</span>` : pill(fix.result?.status), c.status === "fix-verified" ? "Same PoC passes after the fix" : c.status === "fix-failed" ? "PoC still breaks it" : "Fix attempt recorded"] : ["Reported", `<span class="pill plain">Report ready</span>`, "Download it for your fixing agent"],
     ["Signed off", human ? pill(human) : `<span class="pill plain">Waiting</span>`, human ? when(signoffs.at(-1).at) : "Only you can confirm it"],
   ];
   const runs = attempts.filter((a) => a.result?.evidence);
   const tab = new URLSearchParams(location.search).get("tab") ?? "summary";
   const tabs = [["summary", "Summary"], ["evidence", "Evidence", runs.length], ["source", "Source", (d.evidence ?? []).length], ["history", "History", attempts.length]];
-  view.innerHTML = top(c.title, { back: { href: `/scans/${encodeURIComponent(c.scan_id)}/findings` }, extra: `${pill(c.severity)}<span class="src"></span><button class="btn sm" id="repro">Run in OpenShell</button>` }) + `
+  view.innerHTML = top(c.title, { back: { href: `/scans/${encodeURIComponent(c.scan_id)}/findings` }, extra: `${pill(c.severity)}<span class="src"></span><button class="btn ghost sm" id="report">Download report</button><button class="btn sm" id="repro">Run in OpenShell</button>` }) + `
   <div class="tabs">${tabs.map(([k, l, n]) => `<a href="?tab=${k}" data-tab="${k}" class="${tab === k ? "on" : ""}">${l}${n ? `<span class="n">${n}</span>` : ""}</a>`).join("")}</div>
   <div class="body">
     <div class="card verdict">${stepState.map(([label, p, note], i) => `<div><span class="no">0${i + 1}</span><b>${label}</b>${p}<p>${esc(note)}</p>${label === "Proved" && d.lastRun ? `<p>Latest run: ${esc(words(d.lastRun.status))}</p>` : ""}</div>`).join("")}</div>
@@ -512,6 +511,16 @@ async function candidate(id) {
     });
   }
   view.querySelectorAll(".tabs a[data-tab]").forEach((a) => a.addEventListener("click", (e) => { e.preventDefault(); history.pushState(null, "", `${location.pathname}?tab=${a.dataset.tab}`); render(); }));
+  document.getElementById("report").addEventListener("click", async (e) => {
+    e.target.disabled = true;
+    try {
+      const report = await api(`/api/candidates/${encodeURIComponent(id)}/report`);
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(new Blob([report.markdown], { type: "text/markdown" }));
+      a.download = `bugclaw-${id.slice(0, 8)}.md`;
+      a.click();
+    } finally { e.target.disabled = false; }
+  });
   document.getElementById("repro").addEventListener("click", async (e) => {
     e.target.disabled = true;
     const msg = document.getElementById("repro-msg");
