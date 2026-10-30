@@ -9,7 +9,7 @@ services:
     branch: main
     buildCommand: npm install
     startCommand: node --experimental-strip-types bin/bugclaw.ts serve --host 0.0.0.0 --port $PORT
-    healthCheckPath: /
+    healthCheckPath: /api/health
     envVars:
       - key: NODE_VERSION
         value: "24"
