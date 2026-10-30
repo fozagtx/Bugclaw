@@ -54,6 +54,7 @@ import {
 	type StageModelSelection,
 } from "./stage-models.ts";
 import type { RunStore } from "./store.ts";
+import { lensEvidenceQuery, tavilySearch, type WebEvidenceLink } from "./tavily.ts";
 import {
 	type DeclaredTool,
 	invertedIndexShortlist,
@@ -166,6 +167,7 @@ export interface HarnessReport {
 	nestedRuntime: NestedRuntimeStatus;
 	stageModels: StageModelSelection[];
 	priorArt: PriorArtUse;
+	webEvidence: WebEvidenceUse;
 	candidates: Candidate[];
 }
 
@@ -175,6 +177,14 @@ export interface PriorArtUse {
 	status: "used" | "not-installed" | "not-web3";
 	cells: Record<string, string[]>;
 	candidates: Record<string, PriorFinding[]>;
+}
+
+export interface WebEvidenceUse {
+	provider: "tavily";
+	status: "used" | "no-key";
+	queries: number;
+	failedQueries: number;
+	cells: Record<string, number>;
 }
 
 export function runIdentity(config: HarnessConfig, snapshot: Snapshot): string {
@@ -252,7 +262,14 @@ export async function runHarness(
 	snapshot: Snapshot,
 	store: RunStore,
 	client: ModelClient,
-	options: { prompt?: StageModelPrompt; catalog?: CatalogModel[]; corpusDir?: string | null } = {},
+	options: {
+		prompt?: StageModelPrompt;
+		catalog?: CatalogModel[];
+		corpusDir?: string | null;
+		tavilyApiKey?: string | null;
+		tavilyFetch?: typeof fetch;
+		tavilyMaxQueries?: number;
+	} = {},
 ): Promise<HarnessReport> {
 	if (Date.parse(config.authorization.expiresAt) <= Date.now()) throw new Error("Authorization expired");
 	const models = {
@@ -555,12 +572,14 @@ export async function runHarness(
 			const found = alreadyFound(candidates);
 			await runPool(group, async (hunt) => {
 				const slice = sliced(hunter, { lens: hunt.lens, recon });
+				const web = await webEvidenceFor(hunt);
 				const result = await execute(
 					hunt.id,
 					hunter,
 					huntPrompt(slice.source, recon!, hunt.lens, hunt.pass, config, {
 						cell: hunt.id,
 						priorArt: priorArtFor(hunt.id),
+						webEvidence: web,
 						rejectedPatterns,
 						alreadyFound: found,
 						tool: hunt.tool,
@@ -603,6 +622,33 @@ export async function runHarness(
 	}
 
 	const corpusDirectory = options.corpusDir ?? null;
+	// Live web evidence via the Tavily API: one bounded search per first-pass hunt
+	// cell, run in the host process only (never inside a sandbox). Queries carry
+	// the hunt lens only, never source content, and failures never abort a cell.
+	const tavilyApiKey = options.tavilyApiKey === undefined ? (process.env.TAVILY_API_KEY ?? null) : options.tavilyApiKey;
+	const tavilyBudget = options.tavilyMaxQueries ?? 12;
+	let tavilyQueries = 0;
+	let tavilyFailed = 0;
+	const webEvidenceByCell = new Map<string, WebEvidenceLink[]>();
+	const webEvidence: WebEvidenceUse = {
+		provider: "tavily",
+		status: tavilyApiKey ? "used" : "no-key",
+		queries: 0,
+		failedQueries: 0,
+		cells: {},
+	};
+	async function webEvidenceFor(hunt: { id: string; lens: string; pass: number }): Promise<WebEvidenceLink[] | undefined> {
+		if (!tavilyApiKey || hunt.pass !== 0 || tavilyQueries >= tavilyBudget) return webEvidenceByCell.get(hunt.id);
+		tavilyQueries += 1;
+		try {
+			const result = await tavilySearch(lensEvidenceQuery(hunt.lens), { apiKey: tavilyApiKey, fetchFn: options.tavilyFetch });
+			webEvidenceByCell.set(hunt.id, result.links);
+			if (result.links.length) webEvidence.cells[hunt.id] = result.links.length;
+		} catch {
+			tavilyFailed += 1;
+		}
+		return webEvidenceByCell.get(hunt.id);
+	}
 	const priorArt: PriorArtUse = {
 		source: "web3-audit-database",
 		release: CORPUS_RELEASE,
@@ -875,6 +921,7 @@ export async function runHarness(
 		trace,
 		nestedRuntime: inspectNestedRuntime(),
 		priorArt,
+		webEvidence: { ...webEvidence, queries: tavilyQueries, failedQueries: tavilyFailed },
 		candidates: listed,
 	};
 }

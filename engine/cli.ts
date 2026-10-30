@@ -195,6 +195,7 @@ async function main(): Promise<void> {
 			prompt,
 			catalog: client.listModels(),
 			corpusDir: corpusEnabled() ? corpusDir() : null,
+			tavilyApiKey: process.env.TAVILY_API_KEY ?? null,
 		});
 		operation = "private report writing";
 		writeReports(output, report);
