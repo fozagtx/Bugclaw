@@ -372,7 +372,7 @@ async function reportTab(el, s, cands) {
   });
   const proven = rows.filter(({ c }) => ["reproduced", "fix-verified", "fix-failed"].includes(c.status)).length;
   const fixed = rows.filter(({ c }) => c.status === "fix-verified").length;
-  const md = [engine?.markdown, ...(engine?.findings ?? []).map((finding) => finding.markdown)].filter(Boolean).join("\n\n");
+  const md = [`# Bugclaw report: ${s.source}`, "", `Scan ${s.id}`, "", `${rows.length} findings, ${proven} proven in an OpenShell sandbox, ${fixed} fix verified. Human signoff is required before any finding is confirmed.`, ...(engine?.findings ?? []).map((finding) => finding.markdown)].join("\n\n");
   el.innerHTML = `<div class="card"><div class="hd"><h3>Bug report</h3><div style="display:flex;gap:10px;align-items:center"><span class="aside">${rows.length} findings · ${proven} proven · ${fixed} fix verified</span><button class="btn ghost" id="dl" style="height:32px">Download .md</button></div></div>
     ${rows.length ? rows.map(({ c, d, fix, where, human }) => `<div class="pad" style="border-top:1px solid var(--line)">
       <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">${pill(c.severity)}<a href="/candidates/${encodeURIComponent(c.id)}" data-link style="font:700 17px/1.25 var(--display);letter-spacing:-.02em;color:var(--ink);text-decoration:none">${esc(c.title)}</a></div>
