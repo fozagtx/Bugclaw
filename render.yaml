@@ -1,0 +1,19 @@
+# Render Blueprint for Bugclaw — deploy this repo as the dashboard demo.
+# Put your real keys in Render → Blueprint → Environment once it deploys
+# (or in the dashboard: NEBIUS_API_KEY is required, TAVILY_API_KEY turns on live web evidence).
+services:
+  - type: web
+    name: bugclaw
+    runtime: node
+    plan: free
+    branch: main
+    buildCommand: npm install
+    startCommand: node --experimental-strip-types bin/bugclaw.ts serve --host 0.0.0.0 --port $PORT
+    healthCheckPath: /
+    envVars:
+      - key: NODE_VERSION
+        value: "24"
+      - key: NEBIUS_API_KEY
+        sync: false # value set in the Render dashboard, never committed
+      - key: TAVILY_API_KEY
+        sync: false # value set in the Render dashboard, never committed
