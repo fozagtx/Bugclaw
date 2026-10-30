@@ -1,0 +1,14 @@
+{
+	"name": "bugclaw-engine",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"license": "MIT",
+	"description": "Bugclaw's source-discovery engine.",
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"scripts": {
+		"test": "node --experimental-strip-types --test --test-timeout=30000 *.test.ts"
+	}
+}
