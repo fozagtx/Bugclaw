@@ -2,6 +2,64 @@
 
 **A private, user-owned security review harness for source code you are authorized to review.**
 
+|  |  |  |
+|---|---|---|
+| [Demo](#demo) · [Palette](#palette) · [Table of contents](#table-of-contents) · [Live web evidence (Tavily API)](#live-web-evidence-tavily-api) · [How it works](#how-it-works) · [Requirements](#requirements) · [Quickstart](#quickstart) · [Serving: dashboard, HTTP API, MCP](#serving-dashboard-http-api-mcp) · [Data layout](#data-layout) · [Sandbox](#sandbox) · [Tests](#tests) · [Repository layout](#repository-layout) · [License](#license) |  |  |
+
+<!-- anchor for the two in-flow sections below -->
+
+## Palette
+
+The dashboard in `web/` uses one accent family across a light and a dark surface. These are the real variables from `web/app.css` — nothing else.
+
+| Role | Light | Dark |
+|---|---|---|
+| Page background | `#e9e9e9` | `#16151d` |
+| Panel / card surface | `#ffffff` | `#1f1e29` |
+| Band (subtle zebra) | `#f2f2f2` | `#272634` |
+| Ink (headlines, body) | `#2f2e41` | `#ecebf3` |
+| Ink 2 / Ink 3 (muted) | `#3b3a4f` / `#565469` | `#d9d8e3` / `#b3b1c3` |
+| Border / hairline | `#d8d8dd` | `#33323f` |
+| **Accent (lime green)** | **`#28E99F`** | **`#28E99F`** |
+| Accent soft (pill tint) | `#C5FFD6` | `#123d2c` |
+| Good / success pill | `#116b45` on `#C5FFD6` | `#7ff5c2` on `#123d2c` |
+| Attention / warning pill | `#6b6a12` on `#ECFFA3` | `#e6f08a` on `#3a3a12` |
+| Bad / risk pill | `#8d1d6e` on `#FFCFFE` | `#ffb8fd` on `#4a1c45` |
+| Info / neutral pill | `#565469` on `#e9e9ee` | `#b3b1c3` on `#2c2b38` |
+| Blue / link pill | `#2a3bd7` on `#e2e9ff` | `#a9b8ff` on `#1f2a55` |
+
+The accent never changes between themes — `#28E99F` is used for the active nav tab inset, the accent button (`.btn.go`), the focus ring, and the running-activity dot. Dark mode flips the button ink from white to `#16151d` so the same green reads as ink on the dark panels.
+
+Fonts are three families, installed as self-hosted woff2 in `web/fonts/`:
+
+| Family | Use | Files |
+|---|---|---|
+| **DM Sans** (400/500/600) | Body, labels, tables | `dm-sans-latin-*.woff2` |
+| **Anybody** (700) | Display headlines (`h1`, `h2`, card titles) | `anybody-latin-700-normal.woff2` |
+| **Space Mono** (400/700) | Mono text, nav, pills, code blocks | `space-mono-latin-*.woff2` |
+
+### Table of contents
+
+```
+Demo
+Palette
+Table of contents
+Live web evidence (Tavily API)
+How it works
+Requirements
+Quickstart
+Full workflow
+Terminal reproduction statuses
+Models and configuration
+Serving: dashboard, HTTP API, MCP
+  NemoClaw
+Data layout
+Sandbox
+Tests
+Repository layout
+License
+```
+
 ## Demo
 
 **Working demo / test build:** `https://YOUR-DEMO-URL-HERE` _← replace with your hosted dashboard or a recorded walkthrough before submitting; see “Running the demo locally” for the fastest way to host one._
