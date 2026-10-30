@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -12,6 +13,7 @@ import { classify, validateFixFiles, validatePoc } from "../src/repro.ts";
 import { evidencePath, writeEvidence } from "../src/evidence.ts";
 import { Store } from "../src/store.ts";
 import { config } from "../src/config.ts";
+import { serve } from "../src/server.ts";
 
 test("Bugclaw defaults to public Nebius Token Factory models and supports overrides", () => {
 	const defaults = config({});
@@ -193,6 +195,95 @@ test("SQLite stores candidates, attempts, and human signoffs", async () => {
 		assert.equal(store.attempts("candidate").length, 1);
 		assert.equal(store.db.prepare("SELECT decision FROM signoffs").get()?.decision, "rejected");
 	} finally { store.close(); await rm(root, { recursive: true, force: true }); }
+});
+
+test("HTTP dashboard and detail APIs use temporary data and serve SPA routes safely", async () => {
+	const root = await mkdtemp(join(tmpdir(), "bugclaw-server-"));
+	const previousCwd = process.cwd();
+	const previousData = process.env.BUGCLAW_DATA;
+	let store: Store | undefined;
+	let service: Awaited<ReturnType<typeof serve>> | undefined;
+	try {
+		const web = join(root, "web");
+		await mkdir(web, { recursive: true });
+		await writeFile(join(web, "index.html"), "<!doctype html><title>Dashboard fixture</title>");
+		await writeFile(join(web, "asset.json"), "{\"ready\":true}");
+		await writeFile(join(web, "font.woff2"), Buffer.from([0, 1, 2]));
+		process.chdir(root);
+		process.env.BUGCLAW_DATA = join(root, "data");
+		store = new Store();
+		store.createScan({ id: "scan", source: "local", authorization: "local self-test" });
+		store.setScan("scan", "done", "snapshot-hash", { summary: "complete" });
+		store.createScan({ id: "empty", source: "local", authorization: "local self-test" });
+		store.putCandidate("scan", { id: "candidate", title: "source candidate", status: "unvalidated", evidence: [] });
+		store.attempt("candidate", "poc", { status: "not-reproduced" });
+		store.attempt("candidate", "unparseable", { status: "temporary" });
+		store.db.prepare("UPDATE attempts SET result=? WHERE step=?").run("not-json", "unparseable");
+
+		service = await serve(0, store);
+		const address = service.server.address();
+		assert.ok(address && typeof address !== "string");
+		const base = `http://127.0.0.1:${address.port}`;
+
+		const spa = await fetch(`${base}/scans/abc`);
+		assert.equal(spa.status, 200);
+		assert.match(await spa.text(), /Dashboard fixture/);
+
+		const asset = await fetch(`${base}/asset.json`);
+		assert.equal(asset.headers.get("content-type"), "application/json");
+		assert.deepEqual(await asset.json(), { ready: true });
+		const font = await fetch(`${base}/font.woff2`);
+		assert.equal(font.headers.get("content-type"), "font/woff2");
+
+		const traversal = await new Promise<{ status: number | undefined; body: string }>((resolveResponse, reject) => {
+			const request = httpRequest({ hostname: "127.0.0.1", port: address.port, path: "/web/../package.json", method: "GET" }, (response) => {
+				let body = "";
+				response.setEncoding("utf8");
+				response.on("data", (part: string) => { body += part; });
+				response.on("end", () => resolveResponse({ status: response.statusCode, body }));
+			});
+			request.on("error", reject);
+			request.end();
+		});
+		assert.equal(traversal.status, 404);
+
+		const signoff = await fetch(`${base}/api/candidates/candidate/signoff`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ decision: "confirmed", note: "Reviewed" }),
+		});
+		assert.equal(signoff.status, 201);
+
+		const detailResponse = await fetch(`${base}/api/candidates/candidate`);
+		assert.equal(detailResponse.status, 200);
+		const detail = await detailResponse.json() as any;
+		assert.deepEqual(detail.data, { id: "candidate", title: "source candidate", status: "unvalidated", evidence: [] });
+		assert.deepEqual(detail.attempts.find((attempt: any) => attempt.step === "poc").result, { status: "not-reproduced" });
+		assert.equal(detail.attempts.find((attempt: any) => attempt.step === "unparseable").result, "not-json");
+		assert.equal(detail.signoffs.length, 1);
+		assert.equal(detail.signoffs[0].decision, "confirmed");
+
+		const scansResponse = await fetch(`${base}/api/scans`);
+		const scans = await scansResponse.json() as any[];
+		assert.equal(scans.find((scan) => scan.id === "scan").candidateCount, 1);
+		assert.equal(scans.find((scan) => scan.id === "empty").candidateCount, 0);
+
+		const scanResponse = await fetch(`${base}/api/scans/scan`);
+		const scan = await scanResponse.json() as any;
+		assert.deepEqual(scan.report, { summary: "complete" });
+		assert.deepEqual(scan.candidates[0].data, { id: "candidate", title: "source candidate", status: "unvalidated", evidence: [] });
+
+		const unknownScan = await fetch(`${base}/api/scans/missing`);
+		assert.equal(unknownScan.status, 404);
+		assert.deepEqual(await unknownScan.json(), { error: "scan not found" });
+	} finally {
+		if (service) await service.close();
+		store?.close();
+		process.chdir(previousCwd);
+		if (previousData === undefined) delete process.env.BUGCLAW_DATA;
+		else process.env.BUGCLAW_DATA = previousData;
+		await rm(root, { recursive: true, force: true });
+	}
 });
 
 test("OpenShell uploads snapshot and PoC at the work root and denies network access", { timeout: 900_000 }, async (t) => {

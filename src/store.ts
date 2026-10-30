@@ -33,13 +33,21 @@ export class Store {
 		this.db.prepare("UPDATE candidates SET status=?,data=? WHERE id=?").run(status,JSON.stringify(data),id);
 	}
 	scan(id: string) { return this.db.prepare("SELECT * FROM scans WHERE id=?").get(id); }
-	scans() { return this.db.prepare("SELECT id,status,source,created_at,snapshot_hash FROM scans ORDER BY created_at DESC").all(); }
+	scans() {
+		return this.db.prepare(`
+			SELECT scans.id,scans.status,scans.source,scans.created_at,scans.snapshot_hash,COUNT(candidates.id) AS candidateCount
+			FROM scans LEFT JOIN candidates ON candidates.scan_id=scans.id
+			GROUP BY scans.id,scans.status,scans.source,scans.created_at,scans.snapshot_hash
+			ORDER BY scans.created_at DESC
+		`).all();
+	}
 	candidates(scanId?: string) { return scanId ? this.db.prepare("SELECT * FROM candidates WHERE scan_id=? ORDER BY id").all(scanId) : this.db.prepare("SELECT * FROM candidates ORDER BY scan_id,id").all(); }
 	candidate(id: string) { return this.db.prepare("SELECT * FROM candidates WHERE id=?").get(id) as any; }
 	attempt(candidateId: string, step: string, result: unknown) {
 		this.db.prepare("INSERT INTO attempts VALUES(?,?,?,?,?,?)").run(randomUUID(),candidateId,step,"done",JSON.stringify(result),new Date().toISOString());
 	}
 	attempts(candidateId: string) { return this.db.prepare("SELECT * FROM attempts WHERE candidate_id=? ORDER BY created_at").all(candidateId); }
+	signoffs(candidateId: string) { return this.db.prepare("SELECT * FROM signoffs WHERE candidate_id=? ORDER BY at").all(candidateId); }
 	signoff(candidateId: string, decision: "confirmed"|"rejected", note: string) {
 		this.db.prepare("INSERT INTO signoffs VALUES(?,?,?,?,?)").run(randomUUID(),candidateId,decision,note,new Date().toISOString());
 	}

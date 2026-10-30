@@ -48,6 +48,10 @@ export async function serve(port = 8787, store = new Store()) {
 	const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
 	await mcp.connect(transport);
 	const server = createHttpServer(async (req, res) => {
+		const rawPath = (req.url ?? "/").split("?", 1)[0] ?? "/";
+		let decodedPath: string;
+		try { decodedPath = decodeURIComponent(rawPath); } catch { return json(res, 404, { error: "not found" }); }
+		if (decodedPath.split("/").includes("..")) return json(res, 404, { error: "not found" });
 		const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "127.0.0.1"}`);
 		if (url.pathname === "/mcp") { await transport.handleRequest(req,res); return; }
 		try {
@@ -83,12 +87,20 @@ export async function serve(port = 8787, store = new Store()) {
 				return;
 			}
 			const detail = /^\/api\/scans\/([^/]+)$/.exec(url.pathname);
-			if (req.method === "GET" && detail) return json(res,200,store.scan(decodeURIComponent(detail[1]!)) ?? null);
+			if (req.method === "GET" && detail) {
+				const row = store.scan(decodeURIComponent(detail[1]!)) as any;
+				if (!row) return json(res,404,{error:"scan not found"});
+				let report: unknown = null;
+				try { if (row.report !== null) report = JSON.parse(row.report); } catch {}
+				const candidates = store.candidates(row.id).map((candidate: any) => ({ ...candidate, data: JSON.parse(candidate.data) }));
+				return json(res,200,{...row,report,candidates});
+			}
 			if (req.method === "GET" && url.pathname === "/api/candidates") return json(res,200,store.candidates(url.searchParams.get("scan") ?? undefined));
 			const candidate = /^\/api\/candidates\/([^/]+)$/.exec(url.pathname);
 			if (req.method === "GET" && candidate) {
 				const row=store.candidate(decodeURIComponent(candidate[1]!));
-				return row ? json(res,200,{...row,data:JSON.parse(row.data),attempts:store.attempts(row.id)}) : json(res,404,{error:"candidate not found"});
+				const attempts = row ? store.attempts(row.id).map((attempt: any) => ({ ...attempt, result: parseStoredResult(attempt.result) })) : [];
+				return row ? json(res,200,{...row,data:JSON.parse(row.data),attempts,signoffs:store.signoffs(row.id)}) : json(res,404,{error:"candidate not found"});
 			}
 			const reproduceRoute = /^\/api\/candidates\/([^/]+)\/reproduce$/.exec(url.pathname);
 			if (req.method === "POST" && reproduceRoute) {
@@ -110,12 +122,18 @@ export async function serve(port = 8787, store = new Store()) {
 				const path=decodeURIComponent(url.pathname.slice("/api/evidence/".length));
 				return json(res,200,{content:await readFile(evidencePath(config().dataDir,path),"utf8")});
 			}
-			if (req.method === "GET") {
+			if (req.method === "GET" && url.pathname !== "/api" && !url.pathname.startsWith("/api/") && !url.pathname.startsWith("/mcp/")) {
 				const webPath = url.pathname === "/" ? "/index.html" : decodeURIComponent(url.pathname);
-				const file=resolve("web/dist",`.${webPath}`);
-				if (file.startsWith(`${resolve("web/dist")}${sep}`) && await exists(file)) {
+				const webRoot = resolve("web");
+				const file=resolve(webRoot,`.${webPath}`);
+				if (file.startsWith(`${resolve("web")}${sep}`) && await exists(file)) {
 					const content=await readFile(file);
 					res.writeHead(200,{"content-type":mime(extname(file))});res.end(content);return;
+				}
+				const index=resolve(webRoot,"index.html");
+				if (index.startsWith(`${resolve("web")}${sep}`) && await exists(index)) {
+					const content=await readFile(index);
+					res.writeHead(200,{"content-type":mime(extname(index))});res.end(content);return;
 				}
 			}
 			return json(res,404,{error:"not found"});
@@ -129,4 +147,8 @@ async function exists(path:string){try{await access(path);return true;}catch{ret
 function strings(value:unknown){return Array.isArray(value)&&value.every((v)=>typeof v==="string")?value:undefined;}
 function json(res:any,status:number,value:unknown){res.writeHead(status,{"content-type":"application/json"});res.end(JSON.stringify(value));}
 async function readJson(req:any):Promise<any>{let data="";for await(const part of req)data+=part;return JSON.parse(data||"{}");}
-function mime(ext:string){return ({".html":"text/html",".js":"text/javascript",".css":"text/css",".svg":"image/svg+xml",".png":"image/png"})[ext]??"application/octet-stream";}
+function parseStoredResult(result: unknown) {
+	if (typeof result !== "string") return result;
+	try { return JSON.parse(result); } catch { return result; }
+}
+function mime(ext:string){return ({".html":"text/html",".js":"text/javascript",".css":"text/css",".svg":"image/svg+xml",".png":"image/png",".woff2":"font/woff2",".json":"application/json"})[ext]??"application/octet-stream";}
