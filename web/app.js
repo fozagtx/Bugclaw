@@ -1,3 +1,5 @@
+import { icon } from "./icons.js";
+
 const view = document.getElementById("view");
 const shell = document.getElementById("shell");
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
@@ -22,16 +24,14 @@ const TONE = {
 const tone = (s) => Object.keys(TONE).find((k) => TONE[k].includes(String(s).toLowerCase())) ?? "";
 const pill = (s, label) => s ? `<span class="pill ${tone(s)}">${esc(label ?? words(s))}</span>` : `<span class="muted">—</span>`;
 const SEV = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
-const icon = (d) => `<svg class="i" viewBox="0 0 16 16">${d}</svg>`;
 const I = {
-  back: icon('<path d="M13 8H3M7 4 3 8l4 4"/>'),
-  arrow: icon('<path d="M3 8h10M9 4l4 4-4 4"/>'),
-  search: icon('<circle cx="7" cy="7" r="4.5"/><path d="m10.5 10.5 3 3"/>'),
-  folder: icon('<path d="M2 4.5h4l1.5 1.5H14v6.5H2z"/>'),
-  git: icon('<circle cx="4.5" cy="4" r="1.5"/><circle cx="4.5" cy="12" r="1.5"/><circle cx="11.5" cy="6" r="1.5"/><path d="M4.5 5.5v5M11.5 7.5c0 2-2 2.5-7 3"/>'),
-  clock: icon('<circle cx="8" cy="8" r="6"/><path d="M8 4.5V8l2.5 1.5"/>'),
-  shield: icon('<path d="M8 1.8 13.5 4v4c0 3.2-2.3 5.3-5.5 6.2C4.8 13.3 2.5 11.2 2.5 8V4z"/>'),
-  file: icon('<path d="M4 1.8h5l3 3v9.4H4z"/><path d="M9 1.8v3h3"/>'),
+  back: icon("arrow-left"),
+  search: icon("search"),
+  folder: icon("folder"),
+  git: icon("git-branch"),
+  clock: icon("clock-3"),
+  shield: icon("shield-alert"),
+  file: icon("file-text"),
 };
 let timers = [];
 let streams = [];
@@ -54,11 +54,37 @@ function scanName(source) {
 }
 const isGit = (v) => /^(https?:\/\/|git@)/.test(String(v).trim());
 
+document.querySelectorAll("[data-icon]").forEach((node) => { node.innerHTML = icon(node.dataset.icon); });
 shell.classList.toggle("collapsed", localStorage.getItem("bugclaw.rail") === "collapsed");
-document.getElementById("collapse").addEventListener("click", () => {
+const collapse = document.getElementById("collapse");
+const paintCollapse = () => {
+  const collapsed = shell.classList.contains("collapsed");
+  collapse.querySelector("[data-icon]").innerHTML = icon(collapsed ? "panel-left-open" : "panel-left-close");
+  collapse.querySelector(".label").textContent = collapsed ? "Expand" : "Collapse";
+  collapse.title = collapsed ? "Expand sidebar" : "Collapse sidebar";
+  collapse.setAttribute("aria-label", collapse.title);
+};
+const paintThemeToggle = () => {
+  const dark = document.documentElement.dataset.theme === "dark";
+  const label = dark ? "Light mode" : "Dark mode";
+  const toggle = document.getElementById("theme-toggle");
+  toggle.innerHTML = `${icon(dark ? "sun" : "moon")}<span class="label">${label}</span>`;
+  toggle.title = label;
+  toggle.setAttribute("aria-label", label);
+};
+paintCollapse();
+paintThemeToggle();
+collapse.addEventListener("click", () => {
   const next = !shell.classList.contains("collapsed");
   shell.classList.toggle("collapsed", next);
   localStorage.setItem("bugclaw.rail", next ? "collapsed" : "open");
+  paintCollapse();
+});
+document.getElementById("theme-toggle").addEventListener("click", () => {
+  const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+  document.documentElement.dataset.theme = next;
+  localStorage.setItem("bugclaw-theme", next);
+  paintThemeToggle();
 });
 document.addEventListener("click", (e) => {
   const row = e.target.closest("tr[data-href]");
@@ -79,6 +105,11 @@ async function render() {
   const section = parts[0] ?? "overview";
   document.querySelectorAll(".rail nav a").forEach((a) => a.classList.toggle("active", a.dataset.nav === section && !(section === "scans" && parts[1] && parts[1] !== "new")));
   recent(parts[0] === "scans" ? parts[1] : null);
+  recentActivityRail(parts[0] === "scans" ? parts[1] : null, parts[0] === "candidates" ? parts[1] : null);
+  timers.push(setInterval(() => {
+    recent(parts[0] === "scans" ? parts[1] : null);
+    recentActivityRail(parts[0] === "scans" ? parts[1] : null, parts[0] === "candidates" ? parts[1] : null);
+  }, 15000));
   try {
     if (path === "/") await overview();
     else if (path === "/scans") await scans();
@@ -101,8 +132,35 @@ function top(title, { back, extra = "", crumb = false } = {}) {
 async function recent(activeId) {
   const box = document.getElementById("recent");
   const list = await api("/api/scans").catch(() => null);
-  if (!list) { box.innerHTML = `<span class="muted" style="padding:6px 10px;font-size:13px">Unavailable</span>`; return; }
-  box.innerHTML = list.length ? list.slice(0, 12).map((s) => `<a href="/scans/${encodeURIComponent(s.id)}" data-link class="${s.id === activeId ? "active" : ""}" title="${esc(s.source)}"><span class="dot ${esc(s.status)}"></span><span class="nm">${esc(scanName(s.source))}</span><span class="t">${esc(new Date(s.created_at).toDateString() === new Date().toDateString() ? clock(s.created_at) : ago(s.created_at))}</span></a>`).join("") : `<span class="muted" style="padding:6px 10px;font-size:13px">No scans yet</span>`;
+  if (!list) { box.innerHTML = `<span class="rail-empty" title="Unavailable">${icon("scan-search")}<span>Unavailable</span></span>`; return; }
+  box.innerHTML = list.length ? list.slice(0, 12).map((s) => `<a href="/scans/${encodeURIComponent(s.id)}" data-link class="${s.id === activeId ? "active" : ""}" title="${esc(`${scanName(s.source)} · ${s.status} · ${ago(s.created_at)}`)}">${icon("scan-search")}<span class="nm">${esc(scanName(s.source))}</span><span class="t">${esc(new Date(s.created_at).toDateString() === new Date().toDateString() ? clock(s.created_at) : ago(s.created_at))}</span></a>`).join("") : `<span class="rail-empty" title="No scans yet">${icon("scan-search")}<span>No scans yet</span></span>`;
+}
+
+function activityIcon(event) {
+  if (event.kind === "signoff") return "badge-check";
+  if (event.kind === "scan") return "scan-search";
+  if (event.step === "poc") return "flask-conical";
+  if (event.step === "judge") return "scale";
+  if (event.step === "fix") return "wrench";
+  return "activity";
+}
+function activityLabel(event) {
+  const status = words(event.status).toLowerCase();
+  if (event.kind === "signoff") return `Signed off: ${status}`;
+  if (event.kind === "scan") return `Scan ${event.status === "complete" ? "completed" : status}`;
+  const step = event.step === "poc" ? "PoC" : words(event.step);
+  return `${step} ${status}`;
+}
+async function recentActivityRail(activeScanId, activeCandidateId) {
+  const box = document.getElementById("activity");
+  const list = await api("/api/activity").catch(() => null);
+  if (!list) { box.innerHTML = `<span class="rail-empty" title="Unavailable">${icon("activity")}<span>Unavailable</span></span>`; return; }
+  box.innerHTML = list.length ? list.map((event) => {
+    const href = event.kind === "scan" ? `/scans/${encodeURIComponent(event.scanId)}` : `/candidates/${encodeURIComponent(event.candidateId)}`;
+    const active = event.kind === "scan" ? event.scanId === activeScanId : event.candidateId === activeCandidateId;
+    const label = activityLabel(event);
+    return `<a href="${href}" data-link class="activity-row${active ? " active" : ""}" title="${esc(`${label} · ${event.title} · ${ago(event.at)}`)}">${icon(activityIcon(event))}<span class="activity-detail"><span class="activity-label">${esc(label)}</span><span class="nm">${esc(event.title)}</span></span><span class="t">${esc(ago(event.at))}</span></a>`;
+  }).join("") : `<span class="rail-empty" title="No activity yet">${icon("activity")}<span>No activity yet</span></span>`;
 }
 
 async function health() {
@@ -114,15 +172,15 @@ async function health() {
 
 function runtimeRows(h) {
   return [
-    ["Nebius Token Factory", h.nebius.keyPresent && h.nebius.modelsAvailable, h.nebius.keyPresent ? (h.nebius.modelError ?? "Nemotron models reachable") : "NEBIUS_API_KEY is not set"],
-    ["OpenShell gateway", h.openshell, h.openshell ? "Connected" : "Run: openshell gateway start"],
-    ["Docker", h.docker, h.docker ? "Daemon reachable" : "Docker daemon not reachable"],
-    ["Runner image", h.runnerImage, h.runnerImage ? "Built" : "Built on first reproduction"],
-    ["Discovery engine", h.engine, h.engine ? "engine/ present" : "engine/ missing"],
+    ["Nebius Token Factory", h.nebius.keyPresent && h.nebius.modelsAvailable, h.nebius.keyPresent ? (h.nebius.modelError ?? "Nemotron models reachable") : "NEBIUS_API_KEY is not set", "brain-circuit"],
+    ["OpenShell gateway", h.openshell, h.openshell ? "Connected" : "Run: openshell gateway start", "terminal"],
+    ["Docker", h.docker, h.docker ? "Daemon reachable" : "Docker daemon not reachable", "container"],
+    ["Runner image", h.runnerImage, h.runnerImage ? "Built" : "Built on first reproduction", "package"],
+    ["Discovery engine", h.engine, h.engine ? "engine/ present" : "engine/ missing", "code-xml"],
   ];
 }
 function runtimeTable(h) {
-  return `<table><thead><tr><th>Component</th><th style="width:140px">Status</th><th>Detail</th></tr></thead><tbody>${runtimeRows(h).map(([k, ok, note]) => `<tr><td>${esc(k)}</td><td>${pill(ok ? "up" : "down", ok ? "Up" : "Down")}</td><td class="muted">${esc(note)}</td></tr>`).join("")}</tbody></table>`;
+  return `<table><thead><tr><th>Component</th><th style="width:140px">Status</th><th>Detail</th></tr></thead><tbody>${runtimeRows(h).map(([k, ok, note, glyph]) => `<tr><td class="runtime-name">${icon(glyph)}${esc(k)}</td><td>${pill(ok ? "up" : "down", ok ? "Up" : "Down")}</td><td class="muted">${esc(note)}</td></tr>`).join("")}</tbody></table>`;
 }
 
 const ENGINE = new Set(["unvalidated", "rejected", "needs-reproduction", "needs-context", "validated", "supported", "candidate"]);
@@ -147,7 +205,7 @@ function candidateTable(list, { showScan, scanLive } = {}) {
 async function overview() {
   const [h, list, cands] = await Promise.all([health(), api("/api/scans"), api("/api/candidates")]);
   const count = (f) => cands.filter(f).length;
-  view.innerHTML = top("Overview", { extra: `<span class="src"></span><a class="btn" href="/scans/new" data-link>New scan ${I.arrow}</a>` }) + `
+  view.innerHTML = top("Overview", { extra: `<span class="src"></span><a class="btn" href="/scans/new" data-link>${icon("scan-search")} New scan</a>` }) + `
   <div class="body">
     <div class="card"><div class="steps">
       <div><span class="no">Scans</span><b style="font-size:28px;letter-spacing:-.02em">${list.length}</b><p>${count(() => true)} candidates found</p></div>
@@ -157,14 +215,14 @@ async function overview() {
     </div></div>
     <div class="grid2">
       <div class="card"><div class="hd"><h3>Recent scans</h3><a class="aside" href="/scans" data-link>All scans</a></div>${scanTable(list.slice(0, 6))}</div>
-      <div class="card"><div class="hd"><h3>Runtime</h3>${pill(runtimeRows(h).every((r) => r[1] || r[0] === "Runner image") ? "up" : "down", runtimeRows(h).every((r) => r[1] || r[0] === "Runner image") ? "Ready" : "Action needed")}</div><div class="pad"><ul class="stages">${runtimeRows(h).map(([k, ok, note]) => `<li><span>${esc(k)}<div class="muted" style="font-size:12.5px">${esc(note)}</div></span>${pill(ok ? "up" : "down", ok ? "Up" : "Down")}</li>`).join("")}</ul></div></div>
+      <div class="card"><div class="hd"><h3>Runtime</h3>${pill(runtimeRows(h).every((r) => r[1] || r[0] === "Runner image") ? "up" : "down", runtimeRows(h).every((r) => r[1] || r[0] === "Runner image") ? "Ready" : "Action needed")}</div><div class="pad"><ul class="stages">${runtimeRows(h).map(([k, ok, note, glyph]) => `<li><span class="runtime-name">${icon(glyph)}<span>${esc(k)}<div class="muted" style="font-size:12.5px">${esc(note)}</div></span></span>${pill(ok ? "up" : "down", ok ? "Up" : "Down")}</li>`).join("")}</ul></div></div>
     </div>
   </div>`;
 }
 
 async function scans() {
   const list = await api("/api/scans");
-  view.innerHTML = top("Scans", { extra: `<span class="src"></span><a class="btn" href="/scans/new" data-link>New scan ${I.arrow}</a>` }) + `
+  view.innerHTML = top("Scans", { extra: `<span class="src"></span><a class="btn" href="/scans/new" data-link>${icon("scan-search")} New scan</a>` }) + `
   <div class="body">
     <div class="ph"><h2>All scans</h2><p>Every scan snapshots the source, hashes each file and runs recon, hunt and validation on Nemotron · ${list.length} in total</p></div>
     <div class="card">${scanTable(list)}</div>
@@ -180,7 +238,7 @@ function newScan() {
         <div class="pad">
           <div class="target">
             <label class="box"><span id="kind-icon" class="muted">${I.folder}</span><input name="source" id="source" required autocomplete="off" placeholder="/path/to/repo or https://github.com/org/repo"><span class="pill plain" id="kind">Local path</span></label>
-            <button class="btn lg" type="submit">Start scan ${I.arrow}</button>
+            <button class="btn lg" type="submit">${icon("scan-search")} Start scan</button>
           </div>
           <p class="hint">A credential-free git URL is cloned once; a local path is copied. Bugclaw never touches a live system.</p>
           <p class="error" id="scan-error"></p>
@@ -267,10 +325,10 @@ async function scanDetail(id, tab) {
   const tasks = act.tasks ?? [];
   const checks = tasks.filter((t) => t.stage === "hunt" || t.stage === "gapfill");
   const base = `/scans/${encodeURIComponent(id)}`;
-  const tabs = [["overview", "Overview"], ["activity", "Activity", tasks.length], ["exploration", "Exploration", checks.length], ["assets", "Assets", act.files?.length], ["findings", "Findings", cands.length], ["report", "Report"]];
+  const tabs = [["overview", "Overview", "layout-dashboard"], ["activity", "Activity", "activity", tasks.length], ["exploration", "Exploration", "radar", checks.length], ["assets", "Assets", "folder-open", act.files?.length], ["findings", "Findings", "shield-alert", cands.length], ["report", "Report", "file-text"]];
   const statusPill = s.status === "running" ? `<span class="pill a">Running</span>` : pill(s.status);
   view.innerHTML = top(scanName(s.source), { back: { href: "/scans" }, extra: `${statusPill}<span class="src" title="${esc(s.source)}">${esc(s.source)}</span><span class="meta">Started ${esc(when(s.created_at))}</span>` }) +
-    `<div class="tabs">${tabs.map(([k, label, n]) => `<a href="${base}${k === "overview" ? "" : `/${k}`}" data-link class="${tab === k ? "on" : ""}">${label}${n ? `<span class="n">${n}</span>` : ""}</a>`).join("")}</div><div class="body" id="tab"></div>`;
+    `<div class="tabs">${tabs.map(([k, label, glyph, n]) => `<a href="${base}${k === "overview" ? "" : `/${k}`}" data-link class="${tab === k ? "on" : ""}">${icon(glyph)}<span>${label}</span>${n ? `<span class="n">${n}</span>` : ""}</a>`).join("")}</div><div class="body" id="tab"></div>`;
   const el = document.getElementById("tab");
   const titles = new Map(cands.map((c) => [c.id, c.title]));
   if (act.error && tab !== "overview" && tab !== "findings") el.innerHTML = `<div class="card"><div class="pad error">Engine activity unavailable: ${esc(act.error)}</div></div>`;
@@ -311,7 +369,7 @@ function overviewTab(el, s, report, tasks, act, cands, live) {
     <div>
       <div class="card"><div class="hd"><h3>Coverage</h3><span class="aside">From the engine's own task log</span></div>
         <div class="pad cov">
-          <div class="ring"><svg viewBox="0 0 120 120"><circle cx="60" cy="60" r="50" fill="none" stroke="#eef0f3" stroke-width="12"/><circle cx="60" cy="60" r="50" fill="none" stroke="${failed.length && !live ? "#9a6100" : "#1f7a45"}" stroke-width="12" stroke-linecap="round" stroke-dasharray="${(C * pct) / 100} ${C}"/></svg><div class="v">${pct}%</div></div>
+          <div class="ring"><svg viewBox="0 0 120 120"><circle cx="60" cy="60" r="50" fill="none" stroke="var(--ring-track)" stroke-width="12"/><circle cx="60" cy="60" r="50" fill="none" stroke="${failed.length && !live ? "var(--ring-warn)" : "var(--ring-good)"}" stroke-width="12" stroke-linecap="round" stroke-dasharray="${(C * pct) / 100} ${C}"/></svg><div class="v">${pct}%</div></div>
           <div>
             ${meter("Hunt lenses finished", hunts.filter((t) => t.status === "done").length, hunts.length, true)}
             ${meter("Candidates validated", vals.filter((t) => t.status === "done").length, vals.length, true)}
@@ -372,8 +430,9 @@ async function reportTab(el, s, cands) {
   });
   const proven = rows.filter(({ c }) => ["reproduced", "fix-verified", "fix-failed"].includes(c.status)).length;
   const fixed = rows.filter(({ c }) => c.status === "fix-verified").length;
-  const md = [`# Bugclaw report: ${s.source}`, "", `Scan ${s.id}`, "", `${rows.length} findings, ${proven} proven in an OpenShell sandbox, ${fixed} fix verified. Human signoff is required before any finding is confirmed.`, ...(engine?.findings ?? []).map((finding) => finding.markdown)].join("\n\n");
-  el.innerHTML = `<div class="card"><div class="hd"><h3>Bug report</h3><div style="display:flex;gap:10px;align-items:center"><span class="aside">${rows.length} findings · ${proven} proven · ${fixed} fix verified</span><button class="btn ghost" id="dl" style="height:32px">Download .md</button></div></div>
+  const summary = engine?.markdown ?? [`# Bugclaw report: ${s.source}`, "", `Scan ${s.id}`, "", `${rows.length} findings, ${proven} proven in an OpenShell sandbox, ${fixed} fix verified. Human signoff is required before any finding is confirmed.`].join("\n\n");
+  const md = [summary, ...(engine?.findings ?? []).map((finding) => finding.markdown)].filter(Boolean).join("\n\n");
+  el.innerHTML = `<div class="card"><div class="hd"><h3>Bug report</h3><div style="display:flex;gap:10px;align-items:center"><span class="aside">${rows.length} findings · ${proven} proven · ${fixed} fix verified</span><button class="btn ghost" id="dl" style="height:32px">${icon("download")} Download .md</button></div></div>
     ${rows.length ? rows.map(({ c, d, fix, where, human }) => `<div class="pad" style="border-top:1px solid var(--line)">
       <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">${pill(c.severity)}<a href="/candidates/${encodeURIComponent(c.id)}" data-link style="font:700 17px/1.25 var(--display);letter-spacing:-.02em;color:var(--ink);text-decoration:none">${esc(c.title)}</a></div>
       <dl class="kv wide" style="margin-top:12px"><dt>Where</dt><dd class="mono">${esc(where || "—")}</dd><dt>Validator</dt><dd>${pill(d.validation ?? d.status)}</dd><dt>Sandbox</dt><dd>${sandboxPill(c)}</dd><dt>Signoff</dt><dd>${human ? pill(human) : `<span class="pill plain">Waiting</span>`}</dd>
@@ -469,11 +528,11 @@ async function candidate(id) {
   ];
   const runs = attempts.filter((a) => a.result?.evidence);
   const tab = new URLSearchParams(location.search).get("tab") ?? "summary";
-  const tabs = [["summary", "Summary"], ["evidence", "Evidence", runs.length], ["source", "Source", (d.evidence ?? []).length], ["history", "History", attempts.length]];
-  view.innerHTML = top(c.title, { back: { href: `/scans/${encodeURIComponent(c.scan_id)}/findings` }, extra: `${pill(c.severity)}<span class="src"></span><button class="btn ghost sm" id="report">Download report</button><button class="btn sm" id="repro">Run in OpenShell</button>` }) + `
-  <div class="tabs">${tabs.map(([k, l, n]) => `<a href="?tab=${k}" data-tab="${k}" class="${tab === k ? "on" : ""}">${l}${n ? `<span class="n">${n}</span>` : ""}</a>`).join("")}</div>
+  const tabs = [["summary", "Summary", "layout-dashboard"], ["evidence", "Evidence", "flask-conical", runs.length], ["source", "Source", "file-code-2", (d.evidence ?? []).length], ["history", "History", "history", attempts.length]];
+  view.innerHTML = top(c.title, { back: { href: `/scans/${encodeURIComponent(c.scan_id)}/findings` }, extra: `${pill(c.severity)}<span class="src"></span><button class="btn ghost sm" id="report">${icon("download")} Download report</button><button class="btn sm" id="repro">${icon("play")} Run in OpenShell</button>` }) + `
+  <div class="tabs">${tabs.map(([k, l, glyph, n]) => `<a href="?tab=${k}" data-tab="${k}" class="${tab === k ? "on" : ""}">${icon(glyph)}<span>${l}</span>${n ? `<span class="n">${n}</span>` : ""}</a>`).join("")}</div>
   <div class="body">
-    <div class="card verdict">${stepState.map(([label, p, note], i) => `<div><span class="no">0${i + 1}</span><b>${label}</b>${p}<p>${esc(note)}</p>${label === "Proved" && d.lastRun ? `<p>Latest run: ${esc(words(d.lastRun.status))}</p>` : ""}</div>`).join("")}</div>
+    <div class="card verdict">${stepState.map(([label, p, note], i) => `<div><span class="no">0${i + 1}</span><b>${icon(({ Found: "search", Proved: "flask-conical", Fixed: "wrench", Reported: "file-text", "Signed off": "badge-check" })[label])}${label}</b>${p}<p>${esc(note)}</p>${label === "Proved" && d.lastRun ? `<p>Latest run: ${esc(words(d.lastRun.status))}</p>` : ""}</div>`).join("")}</div>
     <p class="muted" id="repro-msg" style="margin:-8px 0 16px"></p>
     <div id="ctab"></div>
   </div>`;
@@ -498,7 +557,7 @@ async function candidate(id) {
         <form id="signoff" class="pad" style="display:grid;gap:10px${human ? ";border-top:1px solid var(--line)" : ""}">
           <select name="decision" required><option value="">Decision…</option><option value="confirmed">Confirm: real vulnerability</option><option value="rejected">Reject: not a vulnerability</option></select>
           <textarea name="note" required placeholder="What you checked"></textarea>
-          <div style="display:flex;gap:10px;align-items:center"><button class="btn ghost" type="submit">Record signoff</button><span class="error" id="signoff-error"></span></div>
+          <div style="display:flex;gap:10px;align-items:center"><button class="btn ghost" type="submit">${icon("badge-check")} Record signoff</button><span class="error" id="signoff-error"></span></div>
         </form>
       </div></div>`;
     document.getElementById("signoff").addEventListener("submit", async (e) => {
@@ -512,17 +571,19 @@ async function candidate(id) {
   }
   view.querySelectorAll(".tabs a[data-tab]").forEach((a) => a.addEventListener("click", (e) => { e.preventDefault(); history.pushState(null, "", `${location.pathname}?tab=${a.dataset.tab}`); render(); }));
   document.getElementById("report").addEventListener("click", async (e) => {
-    e.target.disabled = true;
+    const button = e.currentTarget;
+    button.disabled = true;
     try {
       const report = await api(`/api/candidates/${encodeURIComponent(id)}/report`);
       const a = document.createElement("a");
       a.href = URL.createObjectURL(new Blob([report.markdown], { type: "text/markdown" }));
       a.download = `bugclaw-${id.slice(0, 8)}.md`;
       a.click();
-    } finally { e.target.disabled = false; }
+    } finally { button.disabled = false; }
   });
   document.getElementById("repro").addEventListener("click", async (e) => {
-    e.target.disabled = true;
+    const button = e.currentTarget;
+    button.disabled = true;
     const msg = document.getElementById("repro-msg");
     try {
       await api(`/api/candidates/${encodeURIComponent(id)}/reproduce`, { method: "POST" });
@@ -532,7 +593,7 @@ async function candidate(id) {
         const next = await api(`/api/candidates/${encodeURIComponent(id)}`).catch(() => null);
         if (next && next.attempts.length > before) render();
       }, 4000));
-    } catch (err) { msg.textContent = err.message; e.target.disabled = false; }
+    } catch (err) { msg.textContent = err.message; button.disabled = false; }
   });
 }
 
@@ -556,17 +617,23 @@ async function showEvidence(rel, step) {
 
 async function setup() {
   const h = await health();
+  const hostname = location.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  const loopback = hostname === "localhost" || hostname.endsWith(".localhost") || hostname === "::1" || /^127(?:\.\d{1,3}){3}$/.test(hostname);
+  const mcpEndpoint = loopback
+    ? `<dt>Endpoint</dt><dd class="mono">${esc(location.origin)}/mcp</dd>`
+    : `<dt>Endpoint</dt><dd>This public URL does not serve MCP.</dd><dt>Remote setup</dt><dd><code>BUGCLAW_MCP_TOKEN=… bugclaw serve --host &lt;private-ip&gt; --port 8443 --tls-cert cert.pem --tls-key key.pem</code><br><span class="mono">https://&lt;private-ip&gt;:8443/mcp</span></dd>`;
   view.innerHTML = top("Setup") + `<div class="body">
     <div class="ph"><h2>Runtime</h2><p>Bugclaw needs a Nebius Token Factory key and a running OpenShell gateway. Nothing ever runs on the host.</p></div>
     <div class="card">${runtimeTable(h)}</div>
     <div class="grid2" style="grid-template-columns:1fr 1fr">
       <div class="card"><div class="hd"><h3>Environment</h3></div><div class="pad"><dl class="kv wide">
-        <dt class="mono">NEBIUS_API_KEY</dt><dd>Required. Token Factory → API keys.</dd>
-        <dt class="mono">NEBIUS_BASE_URL</dt><dd>Optional. Default <span class="mono">https://api.tokenfactory.nebius.com/v1</span></dd>
-        <dt class="mono">BUGCLAW_DATA</dt><dd>Optional. Default <span class="mono">./data</span>, private (0700)</dd>
+        <dt class="mono">NEBIUS_API_KEY</dt><dd>${h.env.nebiusApiKey ? pill("up", "Connected") : `${pill("down", "Missing")} <span class="muted">Token Factory → API keys</span>`}</dd>
+        <dt class="mono">NEBIUS_BASE_URL</dt><dd><span class="mono">${esc(h.env.nebiusBaseUrl)}</span> · ${h.env.nebiusBaseUrl === "https://api.tokenfactory.nebius.com/v1" ? "default" : "override"}</dd>
+        <dt class="mono">BUGCLAW_DATA</dt><dd>${h.env.dataDirCustom ? "custom" : "default ./data"}</dd>
+        <dt class="mono">BUGCLAW_MCP_TOKEN</dt><dd>${h.env.mcpToken ? "Set" : "Not set"}</dd>
       </dl></div></div>
       <div class="card"><div class="hd"><h3>Agents (MCP)</h3></div><div class="pad"><dl class="kv wide">
-        <dt>Endpoint</dt><dd class="mono">${esc(location.origin)}/mcp</dd>
+        ${mcpEndpoint}
         <dt>Tools</dt><dd class="mono">bugclaw_scan, bugclaw_status, bugclaw_candidates, bugclaw_reproduce, bugclaw_evidence</dd>
         <dt>Signoff</dt><dd>Human-only, from this dashboard or the HTTP API. Not exposed to agents.</dd>
       </dl></div></div>

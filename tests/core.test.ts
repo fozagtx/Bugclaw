@@ -221,6 +221,27 @@ test("MCP bearer authentication and non-loopback binding require the configured 
 		const unauthenticated = await postInitialize(unprotectedAddress.port);
 		assert.equal(unauthenticated.status, 200);
 		assert.equal((await readJsonRpc(unauthenticated)).result.serverInfo.name, "bugclaw");
+		const postWithHost = (host: string) => new Promise<{ status: number | undefined; body: string }>((resolveResponse, reject) => {
+			const request = httpRequest({
+				hostname: "127.0.0.1",
+				port: unprotectedAddress.port,
+				path: "/mcp",
+				method: "POST",
+				headers: { host, accept: "application/json, text/event-stream", "content-type": "application/json" },
+			}, (response) => {
+				let body = "";
+				response.setEncoding("utf8");
+				response.on("data", (part: string) => { body += part; });
+				response.on("end", () => resolveResponse({ status: response.statusCode, body }));
+			});
+			request.on("error", reject);
+			request.end(initializeBody);
+		});
+		const externalHost = await postWithHost("evil.trycloudflare.com");
+		assert.equal(externalHost.status, 403);
+		assert.deepEqual(JSON.parse(externalHost.body), { error: "MCP without BUGCLAW_MCP_TOKEN is only served to loopback hosts" });
+		const loopbackHost = await postWithHost(`127.0.0.1:${unprotectedAddress.port}`);
+		assert.notEqual(loopbackHost.status, 403);
 	} finally {
 		if (unprotectedService) await unprotectedService.close();
 		if (privateService) await privateService.close();
@@ -230,6 +251,83 @@ test("MCP bearer authentication and non-loopback binding require the configured 
 		else process.env.BUGCLAW_DATA = previousData;
 		if (previousToken === undefined) delete process.env.BUGCLAW_MCP_TOKEN;
 		else process.env.BUGCLAW_MCP_TOKEN = previousToken;
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("activity API merges real store events newest first", async () => {
+	const root = await mkdtemp(join(tmpdir(), "bugclaw-activity-"));
+	const previousData = process.env.BUGCLAW_DATA;
+	let store: Store | undefined;
+	let service: Awaited<ReturnType<typeof serve>> | undefined;
+	try {
+		process.env.BUGCLAW_DATA = join(root, "data");
+		store = new Store();
+		store.createScan({ id: "scan-old", source: "owner/older", authorization: "local review" });
+		store.setScan("scan-old", "complete", "snapshot-old", {});
+		store.putCandidate("scan-old", { id: "candidate", title: "Stored finding", status: "unvalidated" });
+		await new Promise((resolveDelay) => setTimeout(resolveDelay, 5));
+		store.attempt("candidate", "poc", { status: "vulnerable" });
+		await new Promise((resolveDelay) => setTimeout(resolveDelay, 5));
+		store.signoff("candidate", "confirmed", "Reviewed");
+		await new Promise((resolveDelay) => setTimeout(resolveDelay, 5));
+		store.createScan({ id: "scan-new", source: "owner/newer", authorization: "local review" });
+		store.setScan("scan-new", "running", "snapshot-new", {});
+		service = await serve(0, store);
+		const address = service.server.address();
+		assert.ok(address && typeof address !== "string");
+		const response = await fetch(`http://127.0.0.1:${address.port}/api/activity`);
+		assert.equal(response.status, 200);
+		const activity = await response.json() as any[];
+		assert.ok(Array.isArray(activity));
+		assert.equal(activity.length, 4);
+		for (const item of activity) {
+			assert.ok(item.at);
+			assert.ok(item.kind);
+			assert.ok(item.status);
+			assert.ok(item.scanId);
+		}
+		assert.deepEqual(activity.map((item) => item.kind), ["scan", "signoff", "attempt", "scan"]);
+		assert.equal(activity[0].title, "owner/newer");
+		assert.equal(activity[1].status, "confirmed");
+		assert.equal(activity[2].status, "vulnerable");
+		assert.equal(activity[2].candidateId, "candidate");
+		assert.ok(activity.every((item, index) => index === 0 || Date.parse(activity[index - 1].at) >= Date.parse(item.at)));
+	} finally {
+		if (service) await service.close();
+		store?.close();
+		if (previousData === undefined) delete process.env.BUGCLAW_DATA;
+		else process.env.BUGCLAW_DATA = previousData;
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("health reports public environment state without serializing the API key", async () => {
+	const root = await mkdtemp(join(tmpdir(), "bugclaw-health-"));
+	const previousData = process.env.BUGCLAW_DATA;
+	let store: Store | undefined;
+	let service: Awaited<ReturnType<typeof serve>> | undefined;
+	try {
+		process.env.BUGCLAW_DATA = join(root, "data");
+		store = new Store();
+		service = await serve(0, store);
+		const address = service.server.address();
+		assert.ok(address && typeof address !== "string");
+		const response = await fetch(`http://127.0.0.1:${address.port}/api/health`);
+		assert.equal(response.status, 200);
+		const serialized = await response.text();
+		const health = JSON.parse(serialized) as any;
+		assert.equal(typeof health.env.nebiusApiKey, "boolean");
+		assert.equal(health.env.nebiusApiKey, Boolean(process.env.NEBIUS_API_KEY));
+		assert.equal(health.env.nebiusBaseUrl, config().baseUrl);
+		assert.equal(health.env.dataDirCustom, true);
+		assert.equal(health.env.mcpToken, Boolean(process.env.BUGCLAW_MCP_TOKEN));
+		if (process.env.NEBIUS_API_KEY) assert.equal(serialized.includes(process.env.NEBIUS_API_KEY), false);
+	} finally {
+		if (service) await service.close();
+		store?.close();
+		if (previousData === undefined) delete process.env.BUGCLAW_DATA;
+		else process.env.BUGCLAW_DATA = previousData;
 		await rm(root, { recursive: true, force: true });
 	}
 });

@@ -41,6 +41,37 @@ export class Store {
 			ORDER BY scans.created_at DESC
 		`).all();
 	}
+	recentActivity(limit = 20) {
+		const size = Number.isFinite(limit) ? Math.max(1, Math.min(50, Math.trunc(limit))) : 20;
+		const scans = this.db.prepare("SELECT created_at AS at,'scan' AS kind,status,id AS scanId,source AS title FROM scans ORDER BY created_at DESC LIMIT ?").all(size);
+		const attempts = this.db.prepare(`
+			SELECT attempts.created_at AS at,'attempt' AS kind,attempts.step,attempts.status AS rowStatus,attempts.result,
+				candidates.scan_id AS scanId,candidates.id AS candidateId,candidates.title
+			FROM attempts JOIN candidates ON candidates.id=attempts.candidate_id
+			ORDER BY attempts.created_at DESC LIMIT ?
+		`).all(size).map((row: any) => {
+			let result: any = {};
+			try { result = JSON.parse(row.result); } catch {}
+			return {
+				at: row.at,
+				kind: row.kind,
+				step: row.step,
+				status: String(result?.status ?? result?.verdict ?? row.rowStatus),
+				scanId: row.scanId,
+				candidateId: row.candidateId,
+				title: row.title,
+			};
+		});
+		const signoffs = this.db.prepare(`
+			SELECT signoffs.at AS at,'signoff' AS kind,signoffs.decision AS status,
+				candidates.scan_id AS scanId,candidates.id AS candidateId,candidates.title
+			FROM signoffs JOIN candidates ON candidates.id=signoffs.candidate_id
+			ORDER BY signoffs.at DESC LIMIT ?
+		`).all(size);
+		return [...scans, ...attempts, ...signoffs]
+			.sort((a: any, b: any) => String(b.at).localeCompare(String(a.at)))
+			.slice(0, size);
+	}
 	candidates(scanId?: string) { return scanId ? this.db.prepare("SELECT * FROM candidates WHERE scan_id=? ORDER BY id").all(scanId) : this.db.prepare("SELECT * FROM candidates ORDER BY scan_id,id").all(); }
 	candidate(id: string) { return this.db.prepare("SELECT * FROM candidates WHERE id=?").get(id) as any; }
 	attempt(candidateId: string, step: string, result: unknown) {
