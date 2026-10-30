@@ -1,17 +1,20 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { Sandbox } from "../src/sandbox.ts";
 import { firstJson, NebiusClient, parseChatResponse } from "../src/nebius.ts";
 import { OUTPUT_SCHEMAS, renderPrompt } from "../src/prompts.ts";
-import { makeSnapshot } from "../src/snapshot.ts";
-import { classify, reproduce, validateFixFiles, validatePoc } from "../src/repro.ts";
+import { makeSnapshot, parseGitSource } from "../src/snapshot.ts";
+import { classify, reproduce, shouldAttemptFix, validateFixFiles, validatePoc } from "../src/repro.ts";
 import { evidencePath, writeEvidence } from "../src/evidence.ts";
+import { findingReport } from "../src/report.ts";
 import { Store } from "../src/store.ts";
 import { config } from "../src/config.ts";
 import { serve } from "../src/server.ts";
@@ -62,6 +65,42 @@ async function makeReproFixture() {
 	};
 }
 
+function setFixtureCandidateStatus(fixture: { candidateId: string; store: Store }, status: string, updates: Record<string, unknown> = {}) {
+	const candidate = fixture.store.candidate(fixture.candidateId) as { data: string };
+	const data = { ...(JSON.parse(candidate.data) as Record<string, unknown>), ...updates };
+	fixture.store.setCandidateStatus(fixture.candidateId, status, data);
+	return data;
+}
+
+function makeGenuineReproModel(onPrompt?: (kind: "judge" | "fix-retry", prompt: string) => void) {
+	return {
+		async complete(_modelId: string, _system: string, prompt: string) {
+			let value;
+			if (prompt.startsWith("Write a proof-of-concept test")) {
+				value = {
+					files: [{
+						path: ".bugclaw/poc/test.js",
+						content: `require(require("path").resolve(process.cwd(), "src/main.js"));\nconsole.log("BUGCLAW_VULNERABLE");`,
+					}],
+					command: ["node", ".bugclaw/poc/test.js"],
+					rationale: "exercise src/main.js",
+				};
+			} else if (prompt.startsWith("Judge whether")) {
+				onPrompt?.("judge", prompt);
+				value = { verdict: "genuine", reason: "The PoC depends on the cited code." };
+			} else if (prompt.startsWith("Your fix did not")) {
+				onPrompt?.("fix-retry", prompt);
+				value = { files: [{ path: "src/main.js", content: "module.exports = {};\n" }], summary: "Proposed fixture fix" };
+			} else if (prompt.startsWith("Write the smallest fix")) {
+				value = { files: [{ path: "src/main.js", content: "module.exports = {};\n" }], summary: "Proposed fixture fix" };
+			} else {
+				throw new Error(`unexpected prompt: ${prompt.slice(0, 40)}`);
+			}
+			return { value, inputTokens: 5, outputTokens: 7 };
+		},
+	};
+}
+
 test("Bugclaw defaults to public Nebius Token Factory models and supports overrides", () => {
 	const defaults = config({});
 	assert.equal(defaults.baseUrl, "https://api.tokenfactory.nebius.com/v1");
@@ -72,6 +111,184 @@ test("Bugclaw defaults to public Nebius Token Factory models and supports overri
 	assert.equal(defaults.models.judge, defaults.models.validator);
 	assert.equal(defaults.models.fix, defaults.models.validator);
 	assert.equal(config({ NEBIUS_BASE_URL: "https://example.invalid/v1/" }).baseUrl, "https://example.invalid/v1");
+	assert.throws(
+		() => config({ BUGCLAW_RECON_MODEL: "nebius/openai/gpt-oss-120b" }),
+		/Bugclaw only runs NVIDIA Nemotron models on Nebius Token Factory: nebius\/openai\/gpt-oss-120b/,
+	);
+	assert.equal(
+		config({ BUGCLAW_RECON_MODEL: "nebius/nvidia/nemotron-3-super-120b-a12b" }).models.recon,
+		"nebius/nvidia/nemotron-3-super-120b-a12b",
+	);
+});
+
+test("MCP bearer authentication and non-loopback binding require the configured token", async () => {
+	const root = await mkdtemp(join(tmpdir(), "bugclaw-mcp-"));
+	const previousData = process.env.BUGCLAW_DATA;
+	const previousToken = process.env.BUGCLAW_MCP_TOKEN;
+	let store: Store | undefined;
+	let protectedService: Awaited<ReturnType<typeof serve>> | undefined;
+	let privateService: Awaited<ReturnType<typeof serve>> | undefined;
+	let unprotectedService: Awaited<ReturnType<typeof serve>> | undefined;
+	const initializeBody = JSON.stringify({
+		jsonrpc: "2.0",
+		id: 1,
+		method: "initialize",
+		params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "Bugclaw test", version: "1.0.0" } },
+	});
+	try {
+		process.env.BUGCLAW_DATA = join(root, "data");
+		process.env.BUGCLAW_MCP_TOKEN = "expected-secret";
+		store = new Store();
+		protectedService = await serve(0, store);
+		const protectedAddress = protectedService.server.address();
+		assert.ok(protectedAddress && typeof protectedAddress !== "string");
+		const postMcp = (port: number, body: string, authorization?: string) => fetch(`http://127.0.0.1:${port}/mcp`, {
+			method: "POST",
+			headers: {
+				accept: "application/json, text/event-stream",
+				"content-type": "application/json",
+				...(authorization ? { authorization } : {}),
+			},
+			body,
+		});
+		const postInitialize = (port: number, authorization?: string) => postMcp(port, initializeBody, authorization);
+		const readJsonRpc = async (response: any) => {
+			const body = await response.text();
+			if (response.headers.get("content-type")?.includes("text/event-stream")) {
+				const dataLines = body.split(/\r?\n/).filter((line: string) => line.startsWith("data:"));
+				return JSON.parse(dataLines.at(-1)!.slice(5).trim());
+			}
+			return JSON.parse(body);
+		};
+		const missing = await postInitialize(protectedAddress.port);
+		assert.equal(missing.status, 401);
+		assert.equal(missing.headers.get("www-authenticate"), "Bearer");
+		assert.deepEqual(await missing.json(), { error: "unauthorized" });
+		const wrong = await postInitialize(protectedAddress.port, "Bearer wrong-secret");
+		assert.equal(wrong.status, 401);
+		assert.equal(wrong.headers.get("www-authenticate"), "Bearer");
+		assert.deepEqual(await wrong.json(), { error: "unauthorized" });
+		for (let index = 0; index < 2; index++) {
+			const initialized = await postInitialize(protectedAddress.port, "Bearer expected-secret");
+			assert.equal(initialized.status, 200);
+			const response = await readJsonRpc(initialized);
+			assert.equal(response.result.serverInfo.name, "bugclaw");
+		}
+		const listed = await postMcp(
+			protectedAddress.port,
+			JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }),
+			"Bearer expected-secret",
+		);
+		assert.equal(listed.status, 200);
+		const listedResult = await readJsonRpc(listed);
+		const toolNames = listedResult.result.tools.map((tool: { name: string }) => tool.name);
+		assert.deepEqual(toolNames, [
+			"bugclaw_scan",
+			"bugclaw_status",
+			"bugclaw_candidates",
+			"bugclaw_reproduce",
+			"bugclaw_evidence",
+		]);
+		assert.equal(toolNames.some((name: string) => /signoff/i.test(name)), false);
+		const reproduceTool = listedResult.result.tools.find((tool: { name: string }) => tool.name === "bugclaw_reproduce");
+		assert.equal(reproduceTool.inputSchema.properties.fix.description, "also generate and verify a fix; off by default");
+
+		privateService = await serve(0, store, { host: "0.0.0.0" });
+		const privateAddress = privateService.server.address();
+		assert.ok(privateAddress && typeof privateAddress !== "string");
+		const privateHealth = await fetch(`http://127.0.0.1:${privateAddress.port}/api/health`);
+		assert.equal(privateHealth.status, 404);
+		assert.deepEqual(await privateHealth.json(), { error: "not found" });
+		const privateSignoff = await fetch(`http://127.0.0.1:${privateAddress.port}/api/candidates/x/signoff`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ decision: "confirmed", note: "test" }),
+		});
+		assert.equal(privateSignoff.status, 404);
+		assert.deepEqual(await privateSignoff.json(), { error: "not found" });
+		const privateMcp = await postInitialize(privateAddress.port, "Bearer expected-secret");
+		assert.equal(privateMcp.status, 200);
+		assert.equal((await readJsonRpc(privateMcp)).result.serverInfo.name, "bugclaw");
+
+		delete process.env.BUGCLAW_MCP_TOKEN;
+		await assert.rejects(
+			serve(0, store, { host: "0.0.0.0" }),
+			/BUGCLAW_MCP_TOKEN is required to bind a non-loopback host/,
+		);
+		unprotectedService = await serve(0, store);
+		const unprotectedAddress = unprotectedService.server.address();
+		assert.ok(unprotectedAddress && typeof unprotectedAddress !== "string");
+		const unauthenticated = await postInitialize(unprotectedAddress.port);
+		assert.equal(unauthenticated.status, 200);
+		assert.equal((await readJsonRpc(unauthenticated)).result.serverInfo.name, "bugclaw");
+	} finally {
+		if (unprotectedService) await unprotectedService.close();
+		if (privateService) await privateService.close();
+		if (protectedService) await protectedService.close();
+		store?.close();
+		if (previousData === undefined) delete process.env.BUGCLAW_DATA;
+		else process.env.BUGCLAW_DATA = previousData;
+		if (previousToken === undefined) delete process.env.BUGCLAW_MCP_TOKEN;
+		else process.env.BUGCLAW_MCP_TOKEN = previousToken;
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("HTTPS serving uses the provided certificate and key", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "bugclaw-https-"));
+	const previousData = process.env.BUGCLAW_DATA;
+	const previousApiKey = process.env.NEBIUS_API_KEY;
+	let store: Store | undefined;
+	let service: Awaited<ReturnType<typeof serve>> | undefined;
+	try {
+		try {
+			execFileSync("openssl", ["version"], { stdio: "ignore" });
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+				t.skip("openssl is unavailable");
+				return;
+			}
+			throw error;
+		}
+		process.env.BUGCLAW_DATA = join(root, "data");
+		delete process.env.NEBIUS_API_KEY;
+		const certPath = join(root, "cert.pem");
+		const keyPath = join(root, "key.pem");
+		execFileSync("openssl", [
+			"req", "-x509", "-newkey", "rsa:2048", "-nodes",
+			"-keyout", keyPath, "-out", certPath, "-days", "1",
+			"-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1",
+		], { stdio: "ignore" });
+		store = new Store();
+		service = await serve(0, store, { host: "127.0.0.1", tlsCert: certPath, tlsKey: keyPath });
+		const address = service.server.address();
+		assert.ok(address && typeof address !== "string");
+		const response = await new Promise<{ status: number | undefined; body: string }>((resolveResponse, reject) => {
+			const request = httpsRequest({
+				hostname: "127.0.0.1",
+				port: address.port,
+				path: "/api/health",
+				rejectUnauthorized: false,
+			}, (incoming) => {
+				let body = "";
+				incoming.setEncoding("utf8");
+				incoming.on("data", (part: string) => { body += part; });
+				incoming.on("end", () => resolveResponse({ status: incoming.statusCode, body }));
+			});
+			request.on("error", reject);
+			request.end();
+		});
+		assert.equal(response.status, 200);
+		assert.ok(response.body.length > 0);
+	} finally {
+		if (service) await service.close();
+		store?.close();
+		if (previousData === undefined) delete process.env.BUGCLAW_DATA;
+		else process.env.BUGCLAW_DATA = previousData;
+		if (previousApiKey === undefined) delete process.env.NEBIUS_API_KEY;
+		else process.env.NEBIUS_API_KEY = previousApiKey;
+		await rm(root, { recursive: true, force: true });
+	}
 });
 
 test("Nebius JSON parsing accepts leading newlines and null tool_calls", () => {
@@ -171,10 +388,47 @@ test("POC relative imports must resolve to a PoC or snapshot file", () => {
 });
 
 test("POC_RETRY renders the previous contract error", () => {
-	const prompt = renderPrompt("POC_RETRY", { CONTRACT_ERROR: "missing import", SANDBOX_RESULT: { notRun: true } }).prompt;
+	const prompt = renderPrompt("POC_RETRY", {
+		PREVIOUS_POC_JSON: {}, SANDBOX_RESULT: { notRun: true }, CONTRACT_ERROR: "missing import",
+		CANDIDATE_JSON: {}, CITED_FILES_WITH_LINE_NUMBERS: "",
+	}).prompt;
 	assert.ok(prompt.includes('SANDBOX_RESULT={"notRun":true}\nCONTRACT_ERROR="missing import"'));
-	assert.match(renderPrompt("POC", {}).prompt, /Never substitute a stub, mock, fake or hand-written replacement/);
-	assert.match(renderPrompt("POC", {}).prompt, /Return \{"cannotReproduce":/);
+	const poc = renderPrompt("POC", {
+		RUNTIMES: "node 22, python 3.11, forge/anvil (Foundry)",
+		CANDIDATE_JSON: {}, CITED_FILES_WITH_LINE_NUMBERS: "",
+		PREVIOUS_POC_JSON: null, SANDBOX_RESULT: { notRun: true }, CONTRACT_ERROR: "none",
+	}).prompt;
+	assert.match(poc, /Never substitute a stub, mock, fake or hand-written replacement/);
+	assert.match(poc, /Return \{"cannotReproduce":/);
+	assert.match(poc, /Detect the vulnerable effect by its presence or by a unique marker value you choose/);
+});
+
+test("all prompt templates render their call-site variables and reject missing values", () => {
+	const pocVariables = {
+		RUNTIMES: "node 22, python 3.11, forge/anvil (Foundry)",
+		CANDIDATE_JSON: {}, CITED_FILES_WITH_LINE_NUMBERS: "src/main.js:1",
+		PREVIOUS_POC_JSON: {}, SANDBOX_RESULT: { notRun: true }, CONTRACT_ERROR: "none",
+	};
+	const sandboxResult = { exitCode: 1, stdoutTail: "BUGCLAW_VULNERABLE", stderrTail: "", timedOut: false };
+	const prompts = [
+		renderPrompt("POC", pocVariables),
+		renderPrompt("POC_RETRY", pocVariables),
+		renderPrompt("JUDGE", {
+			CANDIDATE_JSON: {}, POC_JSON: {}, SANDBOX_RESULT: sandboxResult, CITED_FILES_WITH_LINE_NUMBERS: "src/main.js:1",
+		}),
+		renderPrompt("FIX", {
+			CANDIDATE_JSON: {}, POC_JSON: {}, PREVIOUS_FIX_JSON: null, SANDBOX_RESULT: sandboxResult, CITED_FILES_FULL: "source",
+		}),
+		renderPrompt("FIX_RETRY", {
+			CANDIDATE_JSON: {}, POC_JSON: {}, PREVIOUS_FIX_JSON: {}, SANDBOX_RESULT: sandboxResult, CITED_FILES_FULL: "source",
+		}),
+	];
+	for (const { prompt } of prompts) assert.doesNotMatch(prompt, /\$\{/);
+	assert.ok(prompts[2].prompt.includes("BUGCLAW_VULNERABLE"));
+	assert.throws(
+		() => renderPrompt("JUDGE", { CANDIDATE_JSON: {}, POC_JSON: {}, CITED_FILES_WITH_LINE_NUMBERS: "" }),
+		{ message: "Unrendered prompt placeholder in JUDGE: ${SANDBOX_RESULT}" },
+	);
 });
 
 test("POC validation repairs escaped file text once and preserves files with real newlines", () => {
@@ -235,6 +489,49 @@ test("source snapshot manifests and hashes are deterministic", async () => {
 		const second = await makeSnapshot(source, join(root, "second"), ["config.ts"]);
 		assert.deepEqual(first.manifest, second.manifest);
 		assert.equal(first.snapshotHash, second.snapshotHash);
+		assert.equal(first.ref, null);
+		assert.equal(first.commit, null);
+	} finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("Git sources validate optional refs and resolve a locally tagged clone", async () => {
+	assert.equal(parseGitSource("https://github.com/owner/repo#2.0.0").ref, "2.0.0");
+	assert.equal(parseGitSource("https://github.com/owner/repo#v1.2.3").ref, "v1.2.3");
+	for (const source of [
+		"https://github.com/owner/repo#-x",
+		"https://github.com/owner/repo#a..b",
+		"https://github.com/owner/repo#",
+		"https://user:password@github.com/owner/repo#2.0.0",
+		"https://github.com/owner/repo?token=secret#2.0.0",
+	]) assert.throws(() => parseGitSource(source));
+
+	const root = await mkdtemp(join(tmpdir(), "bugclaw-git-ref-"));
+	try {
+		const bare = join(root, "repo.git");
+		const work = join(root, "work");
+		await mkdir(work, { recursive: true });
+		execFileSync("git", ["init", "--bare", bare], { stdio: "ignore" });
+		execFileSync("git", ["init", work], { stdio: "ignore" });
+		execFileSync("git", ["-C", work, "config", "user.name", "Bugclaw Test"]);
+		execFileSync("git", ["-C", work, "config", "user.email", "bugclaw-test@example.invalid"]);
+		await writeFile(join(work, "index.js"), "module.exports = 1;\n");
+		execFileSync("git", ["-C", work, "add", "index.js"]);
+		execFileSync("git", ["-C", work, "commit", "-m", "fixture"]);
+		execFileSync("git", ["-C", work, "tag", "v2.0.0"]);
+		execFileSync("git", ["-C", work, "branch", "-M", "main"]);
+		execFileSync("git", ["-C", work, "remote", "add", "origin", bare]);
+		execFileSync("git", ["-C", work, "push", "origin", "main", "v2.0.0"], { stdio: "ignore" });
+		execFileSync("git", ["--git-dir", bare, "symbolic-ref", "HEAD", "refs/heads/main"]);
+		const expectedCommit = execFileSync("git", ["-C", work, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+
+		const url = pathToFileURL(bare).href;
+		const snapshot = await makeSnapshot(`${url}#v2.0.0`, join(root, "tagged"));
+		assert.equal(snapshot.ref, "v2.0.0");
+		assert.equal(snapshot.commit, expectedCommit);
+		assert.deepEqual(snapshot.files, ["index.js"]);
+		const defaultBranch = await makeSnapshot(url, join(root, "default-branch"));
+		assert.equal(defaultBranch.ref, null);
+		assert.equal(defaultBranch.commit, expectedCommit);
 	} finally { await rm(root, { recursive: true, force: true }); }
 });
 
@@ -276,6 +573,8 @@ test("HTTP dashboard and detail APIs use temporary data and serve SPA routes saf
 		const scanDir = join(process.env.BUGCLAW_DATA!, "scans", "scan");
 		const engineOutput = join(scanDir, "engine-output");
 		await mkdir(engineOutput, { recursive: true });
+		await writeFile(join(engineOutput, "report.md"), "# Scan report\nA reviewable result.\n");
+		await writeFile(join(engineOutput, "FINDINGS-DETAIL.md"), "## Findings\nOne finding.\n");
 		await writeFile(join(scanDir, "manifest.json"), JSON.stringify([
 			{ path: "src/app.js", sha256: "abc123" },
 			{ path: "src/lib.js", sha256: "def456" },
@@ -342,6 +641,23 @@ test("HTTP dashboard and detail APIs use temporary data and serve SPA routes saf
 		assert.deepEqual(scan.report, { summary: "complete" });
 		assert.deepEqual(scan.candidates[0].data, { id: "candidate", title: "source candidate", status: "unvalidated", evidence: [] });
 
+		const reportResponse = await fetch(`${base}/api/scans/scan/report`);
+		assert.equal(reportResponse.status, 200);
+		const report = await reportResponse.json() as any;
+		assert.equal(report.markdown, "# Scan report\nA reviewable result.\n");
+		assert.equal(report.findingsDetail, "## Findings\nOne finding.\n");
+		assert.deepEqual(report.findings.map((finding: any) => ({ candidateId: finding.candidateId, title: finding.title })), [{ candidateId: "candidate", title: "source candidate" }]);
+		assert.match(report.findings[0].markdown, /No PoC has been run/);
+		const candidateReport = await fetch(`${base}/api/candidates/candidate/report`);
+		assert.equal(candidateReport.status, 200);
+		assert.match((await candidateReport.json()).markdown, /No PoC has been run/);
+		const unknownCandidateReport = await fetch(`${base}/api/candidates/missing/report`);
+		assert.equal(unknownCandidateReport.status, 404);
+		assert.deepEqual(await unknownCandidateReport.json(), { error: "candidate not found" });
+		const emptyReportResponse = await fetch(`${base}/api/scans/empty/report`);
+		assert.equal(emptyReportResponse.status, 200);
+		assert.deepEqual(await emptyReportResponse.json(), { markdown: null, findingsDetail: null, findings: [] });
+
 		const activityResponse = await fetch(`${base}/api/scans/scan/activity`);
 		assert.equal(activityResponse.status, 200);
 		const activity = await activityResponse.json() as any;
@@ -373,6 +689,9 @@ test("HTTP dashboard and detail APIs use temporary data and serve SPA routes saf
 		const unknownActivity = await fetch(`${base}/api/scans/missing/activity`);
 		assert.equal(unknownActivity.status, 404);
 		assert.deepEqual(await unknownActivity.json(), { error: "scan not found" });
+		const unknownReport = await fetch(`${base}/api/scans/missing/report`);
+		assert.equal(unknownReport.status, 404);
+		assert.deepEqual(await unknownReport.json(), { error: "scan not found" });
 	} finally {
 		if (service) await service.close();
 		store?.close();
@@ -381,6 +700,64 @@ test("HTTP dashboard and detail APIs use temporary data and serve SPA routes saf
 		else process.env.BUGCLAW_DATA = previousData;
 		await rm(root, { recursive: true, force: true });
 	}
+});
+
+test("findingReport uses the real persisted candidate and evidence rows", async () => {
+	const liveData = "/home/ubuntu/repos/Bugclaw/data";
+	const candidateId = "480457e3967ba72abd6e1029-dcd5c2e3972426ef";
+	const scanId = "319e6ca2-e3c9-4661-9381-8fd9dba066b4";
+	const live = new DatabaseSync(join(liveData, "bugclaw.sqlite"), { readOnly: true });
+	const candidate = live.prepare("SELECT * FROM candidates WHERE id=?").get(candidateId) as any;
+	const scan = live.prepare("SELECT * FROM scans WHERE id=?").get(scanId) as any;
+	const attempts = live.prepare("SELECT * FROM attempts WHERE candidate_id=? ORDER BY created_at").all(candidateId) as any[];
+	assert.ok(candidate);
+	assert.ok(scan);
+	assert.ok(attempts.length);
+	const root = await mkdtemp(join(tmpdir(), "bugclaw-report-"));
+	const previousData = process.env.BUGCLAW_DATA;
+	process.env.BUGCLAW_DATA = join(root, "data");
+	let store: Store | undefined;
+	try {
+		store = new Store(join(process.env.BUGCLAW_DATA, "bugclaw.sqlite"));
+		store.createScan({ id: scan.id, source: scan.source, authorization: scan.authorization });
+		store.setScan(scan.id, scan.status, scan.snapshot_hash, JSON.parse(scan.report));
+		const candidateData = JSON.parse(candidate.data);
+		store.putCandidate(scan.id, candidateData);
+		store.setCandidateStatus(candidate.id, candidate.status, candidateData);
+		for (const attempt of attempts) {
+			const result = JSON.parse(attempt.result);
+			if (typeof result.evidence === "string") {
+				const relativeEvidence = result.evidence.slice(`${liveData}/`.length);
+				const copiedEvidence = join(process.env.BUGCLAW_DATA, relativeEvidence);
+				await cp(result.evidence, copiedEvidence, { recursive: true });
+				result.evidence = copiedEvidence;
+			}
+			store.attempt(candidateId, attempt.step, result);
+		}
+		const report = await findingReport(store, candidateId);
+		assert.match(report, /Object\.prototype/);
+		assert.match(report, /node/);
+		assert.match(report, /\.bugclaw\/poc\/test\.js/);
+		assert.match(report, /Exit code: 1/);
+		assert.match(report, /network_policies: \{\}/);
+		assert.match(report, /sh replay\.sh/);
+		assert.match(report, /creates a fresh sandbox/);
+		assert.match(report, /The test uses the actual parser/);
+		assert.match(report, /awaiting human confirmation/);
+		assert.doesNotMatch(report, /confirmed vulnerability/i);
+	} finally {
+		store?.close();
+		live.close();
+		if (previousData === undefined) delete process.env.BUGCLAW_DATA;
+		else process.env.BUGCLAW_DATA = previousData;
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("reproduce defaults to no fix", () => {
+	assert.equal(shouldAttemptFix({}), false);
+	assert.equal(shouldAttemptFix({ fix: false }), false);
+	assert.equal(shouldAttemptFix({ fix: true }), true);
 });
 
 test("cannotReproduce ends without running a sandbox or writing evidence", async () => {
@@ -485,6 +862,141 @@ test("a final PoC validation failure terminates as invalid-poc with its contract
 		const attempts = fixture.store.attempts(fixture.candidateId) as any[];
 		assert.equal(attempts.length, 3);
 		assert.deepEqual(JSON.parse(attempts.at(-1).result), { status: "invalid", reason: "invalid PoC command" });
+	} finally { await fixture.cleanup(); }
+});
+
+test("a safe rerun records its outcome without downgrading a proven candidate", async () => {
+	const fixture = await makeReproFixture();
+	setFixtureCandidateStatus(fixture, "fix-verified");
+	let sandboxRuns = 0;
+	const sandbox = {
+		async run() {
+			sandboxRuns++;
+			return { exitCode: 0, stdout: "BUGCLAW_SAFE", stderr: "", timedOut: false };
+		},
+	};
+	try {
+		const output = await reproduce(fixture.scanId, fixture.candidateId, { store: fixture.store, model: makeGenuineReproModel(), sandbox } as any);
+		assert.equal(output[0].status, "not-reproduced");
+		assert.equal(sandboxRuns, 1);
+		const candidate = fixture.store.candidate(fixture.candidateId) as any;
+		assert.equal(candidate.status, "fix-verified");
+		const data = JSON.parse(candidate.data);
+		assert.equal(data.lastRun.status, "not-reproduced");
+		assert.equal(data.lastRun.reason, null);
+		assert.ok(Number.isFinite(Date.parse(data.lastRun.at)));
+		const attempts = fixture.store.attempts(fixture.candidateId) as any[];
+		assert.equal(attempts.length, 1);
+		assert.equal(attempts[0].step, "poc");
+		assert.equal(JSON.parse(attempts[0].result).status, "safe");
+	} finally { await fixture.cleanup(); }
+});
+
+test("a no-citations rerun records its outcome without downgrading a proven candidate", async () => {
+	const fixture = await makeReproFixture();
+	setFixtureCandidateStatus(fixture, "fix-verified", { evidence: [] });
+	let modelCalls = 0;
+	let sandboxRuns = 0;
+	const model = { async complete() { modelCalls++; throw new Error("model must not run"); } };
+	const sandbox = { async run() { sandboxRuns++; throw new Error("sandbox must not run"); } };
+	try {
+		const output = await reproduce(fixture.scanId, fixture.candidateId, { store: fixture.store, model, sandbox } as any);
+		assert.equal(output[0].status, "not-reproducible");
+		assert.equal(modelCalls, 0);
+		assert.equal(sandboxRuns, 0);
+		const candidate = fixture.store.candidate(fixture.candidateId) as any;
+		assert.equal(candidate.status, "fix-verified");
+		const data = JSON.parse(candidate.data);
+		assert.equal(data.lastRun.status, "not-reproducible");
+		assert.equal(data.lastRun.reason, "candidate has no cited source files");
+		const attempts = fixture.store.attempts(fixture.candidateId) as any[];
+		assert.equal(attempts.length, 1);
+		assert.deepEqual(JSON.parse(attempts[0].result), {
+			status: "not-reproducible",
+			reason: "candidate has no cited source files",
+		});
+	} finally { await fixture.cleanup(); }
+});
+
+test("a genuine rerun promotes a non-proven candidate", async () => {
+	const fixture = await makeReproFixture();
+	setFixtureCandidateStatus(fixture, "not-reproduced");
+	let sandboxRuns = 0;
+	const sandbox = {
+		async run() {
+			sandboxRuns++;
+			return sandboxRuns === 1
+				? { exitCode: 1, stdout: "BUGCLAW_VULNERABLE", stderr: "", timedOut: false }
+				: { exitCode: 0, stdout: "BUGCLAW_SAFE", stderr: "", timedOut: false };
+		},
+	};
+	try {
+		const output = await reproduce(fixture.scanId, fixture.candidateId, { store: fixture.store, model: makeGenuineReproModel(), sandbox, fix: true } as any);
+		assert.equal(output[0].status, "fix-verified");
+		const candidate = fixture.store.candidate(fixture.candidateId) as any;
+		assert.equal(candidate.status, "fix-verified");
+		assert.equal(JSON.parse(candidate.data).reproStatus, "fix-verified");
+		assert.equal(JSON.parse(candidate.data).lastRun, undefined);
+		assert.deepEqual((fixture.store.attempts(fixture.candidateId) as any[]).map((attempt) => attempt.step), ["poc", "judge", "fix"]);
+	} finally { await fixture.cleanup(); }
+});
+
+test("a genuine fix failure can replace a previously verified fix status", async () => {
+	const fixture = await makeReproFixture();
+	setFixtureCandidateStatus(fixture, "fix-verified", {
+		lastRun: { status: "not-reproduced", reason: null, at: "2025-01-01T00:00:00.000Z" },
+	});
+	let sandboxRuns = 0;
+	const sandbox = {
+		async run() {
+			sandboxRuns++;
+			return { exitCode: 1, stdout: "BUGCLAW_VULNERABLE", stderr: "", timedOut: false };
+		},
+	};
+	try {
+		const output = await reproduce(fixture.scanId, fixture.candidateId, { store: fixture.store, model: makeGenuineReproModel(), sandbox, fix: true } as any);
+		assert.equal(output[0].status, "fix-failed");
+		assert.equal(sandboxRuns, 3);
+		const candidate = fixture.store.candidate(fixture.candidateId) as any;
+		assert.equal(candidate.status, "fix-failed");
+		const data = JSON.parse(candidate.data);
+		assert.equal(data.reproStatus, "fix-failed");
+		assert.equal(data.lastRun, undefined);
+		const fixAttempts = (fixture.store.attempts(fixture.candidateId) as any[]).filter((attempt) => attempt.step === "fix");
+		assert.equal(fixAttempts.length, 2);
+		assert.ok(fixAttempts.every((attempt) => JSON.parse(attempt.result).status === "fix-failed"));
+	} finally { await fixture.cleanup(); }
+});
+
+test("reproduction supplies sandbox output to judge and fix-retry prompts", async () => {
+	const fixture = await makeReproFixture();
+	const pocStdout = "BUGCLAW_VULNERABLE from the PoC run";
+	const fixStdout = "BUGCLAW_VULNERABLE from the failed fix run";
+	let judgePrompt = "";
+	let fixRetryPrompt = "";
+	const model = makeGenuineReproModel((kind, prompt) => {
+		if (kind === "judge") judgePrompt = prompt;
+		else fixRetryPrompt = prompt;
+	});
+	let sandboxRuns = 0;
+	const sandbox = {
+		async run() {
+			sandboxRuns++;
+			if (sandboxRuns === 1) return { exitCode: 1, stdout: pocStdout, stderr: "poc stderr", timedOut: false };
+			if (sandboxRuns === 2) return { exitCode: 1, stdout: fixStdout, stderr: "fix stderr", timedOut: false };
+			return { exitCode: 0, stdout: "BUGCLAW_SAFE", stderr: "", timedOut: false };
+		},
+	};
+	try {
+		const output = await reproduce(fixture.scanId, fixture.candidateId, { store: fixture.store, model, sandbox, fix: true } as any);
+		assert.equal(output[0].status, "fix-verified");
+		assert.ok(judgePrompt.includes(pocStdout));
+		assert.ok(fixRetryPrompt.includes(`SANDBOX_RESULT=${JSON.stringify({
+			exitCode: 1,
+			stdoutTail: fixStdout,
+			stderrTail: "fix stderr",
+			timedOut: false,
+		})}`));
 	} finally { await fixture.cleanup(); }
 });
 

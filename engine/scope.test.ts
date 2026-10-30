@@ -54,6 +54,14 @@ function cleanupFixture(t: test.TestContext, directory: string): void {
 
 test("parses only complete, explicit configuration", () => {
 	assert.equal(parseConfig(config()).name, "authorized audit");
+	const metadata = parseConfig(config({
+		source: "https://github.com/owner/repo#2.0.0",
+		ref: "2.0.0",
+		commit: "0123456789abcdef",
+	}));
+	assert.deepEqual({ source: metadata.source, ref: metadata.ref, commit: metadata.commit }, {
+		source: "https://github.com/owner/repo#2.0.0", ref: "2.0.0", commit: "0123456789abcdef",
+	});
 	for (const invalid of [
 		config({ extra: true }),
 		config({

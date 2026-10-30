@@ -4,15 +4,12 @@ import { resolve, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { config } from "./config.ts";
-import { makeSnapshot } from "./snapshot.ts";
+import { makeSnapshot, parseGitSource } from "./snapshot.ts";
 import { Store } from "./store.ts";
 
 export async function scan(options: { source: string; authorization: string; files?: string[]; domains?: string[]; id?: string }, store = new Store(), progress: (event: unknown) => void = () => {}) {
 	const id = options.id ?? randomUUID();
-	if (/^(https?|git):\/\//.test(options.source)) {
-		const url = new URL(options.source);
-		if (url.username || url.password || url.search || url.hash) throw new Error("Git URL must not contain credentials or query parameters");
-	}
+	parseGitSource(options.source);
 	const cfg = config();
 	const dir = join(cfg.dataDir, "scans", id);
 	await mkdir(dir, { recursive: true, mode: 0o700 });
@@ -24,6 +21,7 @@ export async function scan(options: { source: string; authorization: string; fil
 		const out = join(dir, "engine-output");
 		const scope = {
 			version: 1, name: `bugclaw-${id}`,
+			source: options.source, ref: snap.ref, commit: snap.commit,
 			authorization: { reference: options.authorization, expiresAt: new Date(Date.now() + 7 * 86400000).toISOString().replace(/\.\d{3}Z$/, "Z"), allowRemoteModels: true },
 			root: "snapshot", files: snap.files, domains: options.domains ?? ["web2"],
 			models: {
@@ -39,10 +37,11 @@ export async function scan(options: { source: string; authorization: string; fil
 			progress({ type: "log", message: "resuming incomplete engine run" });
 			exitCode = await runEngine(cfg.engineDir, scopePath, out, progress);
 		}
-		const [report, findings] = await Promise.all([
+		const [engineReport, findings] = await Promise.all([
 			readFile(join(out, "report.json"), "utf8").then(JSON.parse),
 			readFile(join(out, "findings.json"), "utf8").then(JSON.parse),
 		]);
+		const report = { ...engineReport, source: options.source, ref: snap.ref, commit: snap.commit };
 		for (const candidate of findings.candidates ?? []) store.putCandidate(id, candidate);
 		store.setScan(id, exitCode === 0 ? "complete" : "incomplete", snap.snapshotHash, report);
 		return { id, status: exitCode === 0 ? "complete" : "incomplete", snapshot: snap, report, findings, outDir: dir };

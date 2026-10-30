@@ -10,6 +10,7 @@ Contract:
 - The snapshot's third-party dependencies are NOT installed and there is no network, so a require/import of any package that is not in the snapshot itself will fail. Never substitute a stub, mock, fake or hand-written replacement for a dependency, a database, or any part of the snapshot's own logic: a test whose result comes from your replacement proves nothing and will be rejected.
 - If the candidate cannot be proven this way (it needs an uninstalled dependency, a live service, or a database), do not write a test. Return {"cannotReproduce": "<one sentence naming exactly what is missing>"} as the entire JSON object instead.
 - Working directory is the snapshot root. Put every file you create under .bugclaw/poc/ (paths relative to the snapshot root). Snapshot files keep their paths, so load them by absolute path from the working directory, e.g. require(require("path").resolve(process.cwd(), "src/app.js")), never by a guessed relative path.
+- Detect the vulnerable effect by its presence or by a unique marker value you choose, never by an exact type the code may coerce (parsers often store "true" as a string): e.g. check 'key' in Object.prototype, not Object.prototype.key === true.
 - Each file's content is the raw file text with real line breaks; never write newlines as the two characters \\n.
 - Keep it under 120 lines and under 60 seconds of runtime.
 - command is argv with no shell: argv[0] must be exactly one of node, python3, forge or anvil (a bare name, never a path), and the remaining entries are its arguments, e.g. ["node", ".bugclaw/poc/test.js"]. PoC files are not executable, so never pass a script path as argv[0], and never reference node_modules or any interpreter path.
@@ -28,7 +29,7 @@ const JUDGE = `Judge whether this sandbox result genuinely demonstrates the cand
 Keys: verdict (genuine|tautological|unclear), reason (string).
 CANDIDATE_DATA=\${CANDIDATE_JSON}
 POC=\${POC_JSON}
-SANDBOX_RESULT=\${ {exitCode, stdoutTail, stderrTail} }
+SANDBOX_RESULT=\${SANDBOX_RESULT}
 SOURCE_DATA=\${CITED_FILES_WITH_LINE_NUMBERS}`;
 
 const FIX = `Write the smallest fix for the reproduced vulnerability. Change only the cited files. Keep the public behavior for legitimate inputs. Do not edit or delete anything under .bugclaw/. The same proof-of-concept will be re-run against your patched files and must then print BUGCLAW_SAFE and exit 0.
@@ -39,7 +40,7 @@ SOURCE_DATA=\${CITED_FILES_FULL}`;
 
 const FIX_RETRY = `Your fix did not make the proof-of-concept pass. Same rules and keys.
 PREVIOUS_FIX=\${PREVIOUS_FIX_JSON}
-SANDBOX_RESULT=\${ {exitCode, stdoutTail, stderrTail, timedOut} }
+SANDBOX_RESULT=\${SANDBOX_RESULT}
 CANDIDATE_DATA=\${CANDIDATE_JSON}
 POC=\${POC_JSON}
 SOURCE_DATA=\${CITED_FILES_FULL}`;
@@ -114,7 +115,10 @@ export function renderPrompt(name: PromptName, variables: Record<string, unknown
 	const templates = { POC, POC_RETRY, JUDGE, FIX, FIX_RETRY };
 	let prompt = templates[name];
 	for (const [key, value] of Object.entries(variables)) {
+		if (key === "RUNTIMES") continue;
 		prompt = prompt.replaceAll(`\${${key}}`, JSON.stringify(value));
 	}
+	const unrendered = prompt.match(/\$\{[^}]*\}/g)?.find((match) => match !== "${RUNTIMES}");
+	if (unrendered) throw new Error(`Unrendered prompt placeholder in ${name}: ${unrendered}`);
 	return { system: SYSTEM, prompt: prompt.replaceAll("\${RUNTIMES}", RUNTIMES) };
 }

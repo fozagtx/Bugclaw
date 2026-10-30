@@ -12,6 +12,12 @@ const dockerfile = join(root, "sandbox/Dockerfile");
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
 let imageBuild: Promise<{ tag: string; image: any }> | undefined;
 
+function openshell(args: string[], options: { timeout?: number; maxBuffer?: number } = {}) {
+	const pending = exec("openshell", args, options);
+	pending.child.stdin?.end();
+	return pending;
+}
+
 function message(error: unknown) {
 	if (error instanceof Error) {
 		const stderr = "stderr" in error ? String(error.stderr ?? "").trim() : "";
@@ -36,7 +42,7 @@ export class SandboxReadinessError extends SandboxError {
 
 async function infrastructureCommand(label: string, args: string[], timeout: number) {
 	try {
-		return await exec("openshell", args, { timeout });
+		return await openshell(args, { timeout });
 	} catch (error) {
 		throw new SandboxError(`${label} failed: ${message(error)}`, { cause: error });
 	}
@@ -68,7 +74,7 @@ export async function runnerImage() {
 export class Sandbox {
 	async ready() {
 		try {
-			const status = await exec("openshell", ["status"]);
+			const status = await openshell(["status"]);
 			if (!status.stdout.includes("Connected")) throw new SandboxReadinessError("OpenShell gateway is not connected");
 		} catch (error) {
 			if (error instanceof SandboxReadinessError) throw error;
@@ -108,11 +114,11 @@ export class Sandbox {
 				: "tar -xf .bugclaw-snapshot.tar && rm .bugclaw-snapshot.tar";
 			await infrastructureCommand(
 				"OpenShell sandbox upload extraction",
-				["sandbox","exec","-n",sandbox,"--no-login-shell","--","sh","-c",`cd /sandbox/work && ${extractOverlay}`],
+				["sandbox","exec","-n",sandbox,"--no-tty","--","sh","-c",`cd /sandbox/work && ${extractOverlay}`],
 				120000,
 			);
 			try {
-				const result = await exec("openshell",["sandbox","exec","-n",sandbox,"--no-login-shell","--","sh","-c",'cd /sandbox/work && exec "$@"',"bugclaw",...argv],{timeout:timeoutSec*1000,maxBuffer:4_000_000});
+				const result = await openshell(["sandbox","exec","-n",sandbox,"--no-tty","--","sh","-c",'cd /sandbox/work && exec "$@"',"bugclaw",...argv],{timeout:timeoutSec*1000,maxBuffer:4_000_000});
 				stdout=result.stdout; stderr=result.stderr; exitCode=0;
 			} catch (error:any) {
 				stdout=error.stdout??"";

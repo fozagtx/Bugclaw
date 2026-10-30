@@ -267,7 +267,7 @@ async function scanDetail(id, tab) {
   const tasks = act.tasks ?? [];
   const checks = tasks.filter((t) => t.stage === "hunt" || t.stage === "gapfill");
   const base = `/scans/${encodeURIComponent(id)}`;
-  const tabs = [["overview", "Overview"], ["activity", "Activity", tasks.length], ["exploration", "Exploration", checks.length], ["assets", "Assets", act.files?.length], ["findings", "Findings", cands.length]];
+  const tabs = [["overview", "Overview"], ["activity", "Activity", tasks.length], ["exploration", "Exploration", checks.length], ["assets", "Assets", act.files?.length], ["findings", "Findings", cands.length], ["report", "Report"]];
   const statusPill = s.status === "running" ? `<span class="pill a">Running</span>` : pill(s.status);
   view.innerHTML = top(scanName(s.source), { back: { href: "/scans" }, extra: `${statusPill}<span class="src" title="${esc(s.source)}">${esc(s.source)}</span><span class="meta">Started ${esc(when(s.created_at))}</span>` }) +
     `<div class="tabs">${tabs.map(([k, label, n]) => `<a href="${base}${k === "overview" ? "" : `/${k}`}" data-link class="${tab === k ? "on" : ""}">${label}${n ? `<span class="n">${n}</span>` : ""}</a>`).join("")}</div><div class="body" id="tab"></div>`;
@@ -277,6 +277,7 @@ async function scanDetail(id, tab) {
   else if (tab === "activity") activityTab(el, tasks, titles);
   else if (tab === "exploration") explorationTab(el, s, tasks, checks, titles);
   else if (tab === "assets") assetsTab(el, act.files ?? [], cands);
+  else if (tab === "report") await reportTab(el, s, cands);
   else if (tab === "findings") el.innerHTML = `<div class="card"><div class="hd"><h3>Findings</h3><span class="aside">${live ? "Scan still running" : `${cands.length} candidates`}</span></div>${candidateTable(cands, { scanLive: live })}</div><p class="foot">Validator verdicts are model opinions. Only the sandbox column reflects code that actually ran, and only a person can confirm a finding.</p>`;
   else overviewTab(el, s, report, tasks, act, cands, live);
   if (live) timers.push(setInterval(async () => {
@@ -324,6 +325,7 @@ function overviewTab(el, s, report, tasks, act, cands, live) {
           <div class="quote">${esc(s.authorization)}</div>
           <dl class="kv wide" style="margin-top:20px">
             <dt>Target</dt><dd class="mono">${esc(s.source)}</dd>
+            ${report?.snapshot?.ref ? `<dt>Ref</dt><dd class="mono">${esc(report.snapshot.ref)}${report.snapshot.commit ? ` · ${esc(String(report.snapshot.commit).slice(0, 12))}` : ""}</dd>` : ""}
             <dt>Snapshot</dt><dd class="mono">${esc(s.snapshot_hash ?? "pending")}</dd>
             ${report?.models ? Object.entries(report.models).map(([k, m]) => `<dt>${esc(words(k))} model</dt><dd class="mono">${esc(m.id)}</dd>`).join("") : ""}
             <dt>Execution</dt><dd>Source-only analysis. PoCs run only in OpenShell with egress denied.</dd>
@@ -355,6 +357,31 @@ function overviewTab(el, s, report, tasks, act, cands, live) {
       </div>
     </div>
   </div>`;
+}
+
+async function reportTab(el, s, cands) {
+  const rank = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
+  const [details, engine] = await Promise.all([
+    Promise.all([...cands].sort((a, b) => (rank[a.severity] ?? 9) - (rank[b.severity] ?? 9)).map((c) => api(`/api/candidates/${encodeURIComponent(c.id)}`).catch(() => c))),
+    api(`/api/scans/${encodeURIComponent(s.id)}/report`).catch(() => ({})),
+  ]);
+  const rows = details.map((c) => {
+    const d = parse(c.data) ?? c.data ?? {};
+    const fix = [...(c.attempts ?? [])].reverse().map((a) => ({ ...a, result: parse(a.result) })).find((a) => a.step === "fix" && a.result?.summary);
+    return { c, d, fix: fix?.result?.summary, where: (d.evidence ?? []).map((e) => `${e.path}:${e.startLine}`).join(", "), human: (c.signoffs ?? []).at(-1)?.decision };
+  });
+  const proven = rows.filter(({ c }) => ["reproduced", "fix-verified", "fix-failed"].includes(c.status)).length;
+  const fixed = rows.filter(({ c }) => c.status === "fix-verified").length;
+  const md = [`# Bugclaw report: ${s.source}`, "", `Scan ${s.id}`, "", `${rows.length} findings, ${proven} proven in an OpenShell sandbox, ${fixed} fix verified. Human signoff is required before any finding is confirmed.`, ...(engine?.findings ?? []).map((finding) => finding.markdown)].join("\n\n");
+  el.innerHTML = `<div class="card"><div class="hd"><h3>Bug report</h3><div style="display:flex;gap:10px;align-items:center"><span class="aside">${rows.length} findings · ${proven} proven · ${fixed} fix verified</span><button class="btn ghost" id="dl" style="height:32px">Download .md</button></div></div>
+    ${rows.length ? rows.map(({ c, d, fix, where, human }) => `<div class="pad" style="border-top:1px solid var(--line)">
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">${pill(c.severity)}<a href="/candidates/${encodeURIComponent(c.id)}" data-link style="font:700 17px/1.25 var(--display);letter-spacing:-.02em;color:var(--ink);text-decoration:none">${esc(c.title)}</a></div>
+      <dl class="kv wide" style="margin-top:12px"><dt>Where</dt><dd class="mono">${esc(where || "—")}</dd><dt>Validator</dt><dd>${pill(d.validation ?? d.status)}</dd><dt>Sandbox</dt><dd>${sandboxPill(c)}</dd><dt>Signoff</dt><dd>${human ? pill(human) : `<span class="pill plain">Waiting</span>`}</dd>
+      <dt>Root cause</dt><dd class="clamp">${esc(d.rootCause ?? "—")}</dd>${fix ? `<dt>Fix</dt><dd class="clamp">${esc(fix)}</dd>` : ""}</dl></div>`).join("") : `<div class="empty"><b>No findings</b>The engine reported no candidates for this snapshot.</div>`}</div>
+    ${engine?.markdown ? `<div class="card"><div class="hd"><h3>Engine notes</h3><button class="btn ghost" id="eng" style="height:32px">Show</button></div><div class="pad" id="engbody" hidden><pre style="max-height:420px"></pre></div></div>` : ""}`;
+  document.getElementById("dl").addEventListener("click", () => { const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([md], { type: "text/markdown" })); a.download = `bugclaw-report-${s.id.slice(0, 8)}.md`; a.click(); });
+  const eng = document.getElementById("eng");
+  if (eng) eng.addEventListener("click", () => { const b = document.getElementById("engbody"); b.hidden = !b.hidden; b.querySelector("pre").textContent = engine.markdown; eng.textContent = b.hidden ? "Show" : "Hide"; });
 }
 
 function activityTab(el, tasks, titles) {
@@ -437,16 +464,16 @@ async function candidate(id) {
   const stepState = [
     ["Found", pill(d.validation ?? d.status), d.validation === "supported" ? "Validator supports it" : d.validation === "rejected" ? "Validator rejected it" : "Waiting for validator"],
     ["Proved", proved ? `<span class="pill r">Vulnerable</span>` : sandboxStatus(c) === "not run" ? `<span class="pill plain">Not run</span>` : pill(c.status), proved ? "PoC broke it in the sandbox" : sandboxStatus(c) === "not run" ? "Run it in OpenShell" : "Sandbox could not prove it"],
-    ["Fixed", c.status === "fix-verified" ? `<span class="pill g">Fix verified</span>` : c.status === "fix-failed" ? `<span class="pill r">Fix failed</span>` : `<span class="pill plain">—</span>`, c.status === "fix-verified" ? "Same PoC passes after the fix" : c.status === "fix-failed" ? "PoC still breaks it" : "Needs a proven PoC first"],
+    fix ? ["Fixed", c.status === "fix-verified" ? `<span class="pill g">Fix verified</span>` : c.status === "fix-failed" ? `<span class="pill r">Fix failed</span>` : pill(fix.result?.status), c.status === "fix-verified" ? "Same PoC passes after the fix" : c.status === "fix-failed" ? "PoC still breaks it" : "Fix attempt recorded"] : ["Reported", `<span class="pill plain">Report ready</span>`, "Download it for your fixing agent"],
     ["Signed off", human ? pill(human) : `<span class="pill plain">Waiting</span>`, human ? when(signoffs.at(-1).at) : "Only you can confirm it"],
   ];
   const runs = attempts.filter((a) => a.result?.evidence);
   const tab = new URLSearchParams(location.search).get("tab") ?? "summary";
   const tabs = [["summary", "Summary"], ["evidence", "Evidence", runs.length], ["source", "Source", (d.evidence ?? []).length], ["history", "History", attempts.length]];
-  view.innerHTML = top(c.title, { back: { href: `/scans/${encodeURIComponent(c.scan_id)}/findings` }, extra: `${pill(c.severity)}<span class="src"></span><button class="btn sm" id="repro">Run in OpenShell</button>` }) + `
+  view.innerHTML = top(c.title, { back: { href: `/scans/${encodeURIComponent(c.scan_id)}/findings` }, extra: `${pill(c.severity)}<span class="src"></span><button class="btn ghost sm" id="report">Download report</button><button class="btn sm" id="repro">Run in OpenShell</button>` }) + `
   <div class="tabs">${tabs.map(([k, l, n]) => `<a href="?tab=${k}" data-tab="${k}" class="${tab === k ? "on" : ""}">${l}${n ? `<span class="n">${n}</span>` : ""}</a>`).join("")}</div>
   <div class="body">
-    <div class="card verdict">${stepState.map(([label, p, note], i) => `<div><span class="no">0${i + 1}</span><b>${label}</b>${p}<p>${esc(note)}</p></div>`).join("")}</div>
+    <div class="card verdict">${stepState.map(([label, p, note], i) => `<div><span class="no">0${i + 1}</span><b>${label}</b>${p}<p>${esc(note)}</p>${label === "Proved" && d.lastRun ? `<p>Latest run: ${esc(words(d.lastRun.status))}</p>` : ""}</div>`).join("")}</div>
     <p class="muted" id="repro-msg" style="margin:-8px 0 16px"></p>
     <div id="ctab"></div>
   </div>`;
@@ -484,6 +511,16 @@ async function candidate(id) {
     });
   }
   view.querySelectorAll(".tabs a[data-tab]").forEach((a) => a.addEventListener("click", (e) => { e.preventDefault(); history.pushState(null, "", `${location.pathname}?tab=${a.dataset.tab}`); render(); }));
+  document.getElementById("report").addEventListener("click", async (e) => {
+    e.target.disabled = true;
+    try {
+      const report = await api(`/api/candidates/${encodeURIComponent(id)}/report`);
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(new Blob([report.markdown], { type: "text/markdown" }));
+      a.download = `bugclaw-${id.slice(0, 8)}.md`;
+      a.click();
+    } finally { e.target.disabled = false; }
+  });
   document.getElementById("repro").addEventListener("click", async (e) => {
     e.target.disabled = true;
     const msg = document.getElementById("repro-msg");

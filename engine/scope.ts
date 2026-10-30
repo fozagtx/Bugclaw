@@ -13,6 +13,9 @@ export type Domain = "web2" | "web3" | "ai";
 export interface HarnessConfig {
 	version: 1;
 	name: string;
+	source?: string;
+	ref?: string | null;
+	commit?: string | null;
 	authorization: {
 		reference: string;
 		expiresAt: string;
@@ -104,19 +107,19 @@ function fail(message: string): never {
 	throw new Error(`Invalid engine configuration: ${message}`);
 }
 
-function exactKeys(value: Record<string, unknown>, keys: readonly string[], location: string): void {
+function exactKeys(value: Record<string, unknown>, keys: readonly string[], location: string, required = keys): void {
 	const expected = new Set(keys);
 	for (const key of Object.keys(value)) {
 		if (!expected.has(key)) fail(`${location} contains unknown key ${JSON.stringify(key)}`);
 	}
-	for (const key of keys) {
+	for (const key of required) {
 		if (!(key in value)) fail(`${location}.${key} is required`);
 	}
 }
 
-function object(value: unknown, location: string, keys: readonly string[]): Record<string, unknown> {
+function object(value: unknown, location: string, keys: readonly string[], optional: readonly string[] = []): Record<string, unknown> {
 	if (!isRecord(value)) fail(`${location} must be an object`);
-	exactKeys(value, keys, location);
+	exactKeys(value, [...keys, ...optional], location, keys);
 	return value;
 }
 
@@ -198,7 +201,7 @@ export function parseConfig(value: unknown): HarnessConfig {
 		"domains",
 		"models",
 		"limits",
-	]);
+	], ["source", "ref", "commit"]);
 	if (config.version !== 1) fail("config.version must be 1");
 	const authorization = object(config.authorization, "config.authorization", [
 		"reference",
@@ -253,6 +256,9 @@ export function parseConfig(value: unknown): HarnessConfig {
 	return {
 		version: 1,
 		name: text(config.name, "config.name", 200),
+		...(config.source === undefined ? {} : { source: text(config.source, "config.source") }),
+		...(config.ref === undefined ? {} : { ref: config.ref === null ? null : text(config.ref, "config.ref", 100) }),
+		...(config.commit === undefined ? {} : { commit: config.commit === null ? null : text(config.commit, "config.commit", 128) }),
 		authorization: {
 			reference: text(authorization.reference, "config.authorization.reference"),
 			expiresAt: validateExpiry(authorization.expiresAt, "config.authorization.expiresAt"),

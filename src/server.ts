@@ -1,5 +1,7 @@
 import { createServer as createHttpServer } from "node:http";
-import { randomUUID } from "node:crypto";
+import { createServer as createHttpsServer } from "node:https";
+import { isIP } from "node:net";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { access, readFile, stat } from "node:fs/promises";
 import { extname, join, resolve, sep } from "node:path";
 import { EventEmitter } from "node:events";
@@ -16,19 +18,21 @@ import { Store } from "./store.ts";
 import { evidencePath } from "./evidence.ts";
 import { runnerImageTag } from "./sandbox.ts";
 import { EngineStateBusyError, scanActivity } from "./activity.ts";
+import { findingReport } from "./report.ts";
 
 const exec = promisify(execFile);
 const events = new Map<string, EventEmitter>();
+type ServeOptions = { host?: string; tlsCert?: string; tlsKey?: string };
 const signoffDescription = "Human signoff is available only through the HTTP API and is never an MCP tool.";
 const tools = [
 	{ name: "bugclaw_scan", description: `Scan only an authorized local source snapshot. ${signoffDescription}`, inputSchema: { type: "object", properties: { source: {type:"string"}, authorization: {type:"string"}, files: {type:"array",items:{type:"string"}}, domains:{type:"array",items:{type:"string"}} }, required:["source","authorization"] } },
 	{ name: "bugclaw_status", description: `Get scan status and summary. ${signoffDescription}`, inputSchema: {type:"object",properties:{scanId:{type:"string"}},required:["scanId"]} },
 	{ name: "bugclaw_candidates", description: `List candidates; candidate statuses are not human confirmation. ${signoffDescription}`, inputSchema: {type:"object",properties:{scanId:{type:"string"}},required:["scanId"]} },
-	{ name: "bugclaw_reproduce", description: `Reproduce a candidate only inside a network-denied OpenShell sandbox; never claim confirmed. ${signoffDescription}`, inputSchema: {type:"object",properties:{scanId:{type:"string"},candidateId:{type:"string"}},required:["scanId"]} },
+	{ name: "bugclaw_reproduce", description: `Reproduce a candidate only inside a network-denied OpenShell sandbox; never claim confirmed. ${signoffDescription}`, inputSchema: {type:"object",properties:{scanId:{type:"string"},candidateId:{type:"string"},fix:{type:"boolean",description:"also generate and verify a fix; off by default"}},required:["scanId"]} },
 	{ name: "bugclaw_evidence", description: `Read replayable evidence stored inside Bugclaw's data directory. ${signoffDescription}`, inputSchema: {type:"object",properties:{path:{type:"string"}},required:["path"]} },
 ];
 
-export async function serve(port = 8787, store = new Store()) {
+function createMcp(store: Store) {
 	const mcp = new McpServer({ name: "bugclaw", version: "0.1.0" }, { capabilities: { tools: {} } });
 	mcp.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
 	mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -39,22 +43,46 @@ export async function serve(port = 8787, store = new Store()) {
 			result = await scan({ source: args.source, authorization: args.authorization, files: args.files, domains: args.domains }, store);
 		} else if (name === "bugclaw_status") result = store.scan(args.scanId);
 		else if (name === "bugclaw_candidates") result = store.candidates(args.scanId);
-		else if (name === "bugclaw_reproduce") result = await reproduce(args.scanId, args.candidateId, { store });
+		else if (name === "bugclaw_reproduce") result = await reproduce(args.scanId, args.candidateId, { store, fix: args.fix === true });
 		else if (name === "bugclaw_evidence") {
 			const path = evidencePath(config().dataDir, args.path);
 			result = await readFile(path, "utf8");
 		} else throw new Error(`Unknown tool ${name}; signoff is human-only and is not an MCP tool`);
 		return { content: [{ type: "text", text: JSON.stringify(result) }] };
 	});
-	const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-	await mcp.connect(transport);
-	const server = createHttpServer(async (req, res) => {
+	return mcp;
+}
+
+export async function serve(port = 8787, store = new Store(), options: ServeOptions = {}) {
+	const host = options.host ?? "127.0.0.1";
+	const { tlsCert, tlsKey } = options;
+	if (Boolean(tlsCert) !== Boolean(tlsKey)) throw new Error("Both --tls-cert and --tls-key are required");
+	const { mcpToken } = config();
+	if (!isLoopbackHost(host) && !mcpToken) throw new Error("BUGCLAW_MCP_TOKEN is required to bind a non-loopback host");
+	const mcpOnly = servesOnlyMcp(host);
+	const handler = async (req: any, res: any) => {
 		const rawPath = (req.url ?? "/").split("?", 1)[0] ?? "/";
 		let decodedPath: string;
 		try { decodedPath = decodeURIComponent(rawPath); } catch { return json(res, 404, { error: "not found" }); }
 		if (decodedPath.split("/").includes("..")) return json(res, 404, { error: "not found" });
 		const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "127.0.0.1"}`);
-		if (url.pathname === "/mcp") { await transport.handleRequest(req,res); return; }
+		if (mcpOnly && url.pathname !== "/mcp") return json(res, 404, { error: "not found" });
+		if (url.pathname === "/mcp") {
+			if (mcpToken && !hasBearerToken(req.headers.authorization, mcpToken)) {
+				res.writeHead(401, { "content-type": "application/json", "www-authenticate": "Bearer" });
+				res.end(JSON.stringify({ error: "unauthorized" }));
+				return;
+			}
+			const mcp = createMcp(store);
+			const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+			res.once("close", () => {
+				void transport.close();
+				void mcp.close();
+			});
+			await mcp.connect(transport);
+			await transport.handleRequest(req,res);
+			return;
+		}
 		try {
 			if (req.method === "GET" && url.pathname === "/api/health") {
 				const key = Boolean(process.env.NEBIUS_API_KEY);
@@ -98,6 +126,28 @@ export async function serve(port = 8787, store = new Store()) {
 					throw error;
 				}
 			}
+			const scanReport = /^\/api\/scans\/([^/]+)\/report$/.exec(url.pathname);
+			if (req.method === "GET" && scanReport) {
+				const scanId = decodeURIComponent(scanReport[1]!);
+				if (!store.scan(scanId)) return json(res,404,{error:"scan not found"});
+				const output = join(config().dataDir,"scans",scanId,"engine-output");
+				const [markdown,findingsDetail] = await Promise.all([
+					readOptional(join(output,"report.md")),
+					readOptional(join(output,"FINDINGS-DETAIL.md")),
+				]);
+				const findings = await Promise.all((store.candidates(scanId) as any[]).map(async (candidate) => ({
+					candidateId: candidate.id,
+					title: candidate.title,
+					markdown: await findingReport(store, candidate.id),
+				})));
+				return json(res,200,{markdown,findingsDetail,findings});
+			}
+			const candidateReport = /^\/api\/candidates\/([^/]+)\/report$/.exec(url.pathname);
+			if (req.method === "GET" && candidateReport) {
+				const candidateId = decodeURIComponent(candidateReport[1]!);
+				if (!store.candidate(candidateId)) return json(res,404,{error:"candidate not found"});
+				return json(res,200,{markdown:await findingReport(store,candidateId)});
+			}
 			const detail = /^\/api\/scans\/([^/]+)$/.exec(url.pathname);
 			if (req.method === "GET" && detail) {
 				const row = store.scan(decodeURIComponent(detail[1]!)) as any;
@@ -118,7 +168,7 @@ export async function serve(port = 8787, store = new Store()) {
 			if (req.method === "POST" && reproduceRoute) {
 				const row=store.candidate(decodeURIComponent(reproduceRoute[1]!));
 				if (!row) return json(res,404,{error:"candidate not found"});
-				void reproduce(row.scan_id,row.id,{store}).catch((error)=>store.attempt(row.id,"reproduce",{status:"failed",reason:error instanceof Error?error.message:"reproduction failed"}));
+				void reproduce(row.scan_id,row.id,{store,fix:false}).catch((error)=>store.attempt(row.id,"reproduce",{status:"failed",reason:error instanceof Error?error.message:"reproduction failed"}));
 				return json(res,202,{candidateId:row.id,status:"queued"});
 			}
 			const signoff = /^\/api\/candidates\/([^/]+)\/signoff$/.exec(url.pathname);
@@ -151,17 +201,41 @@ export async function serve(port = 8787, store = new Store()) {
 			}
 			return json(res,404,{error:"not found"});
 		} catch (error) { return json(res,500,{error:error instanceof Error?error.message:"request failed"}); }
+	};
+	const server = tlsCert && tlsKey
+		? createHttpsServer({ cert: await readFile(tlsCert), key: await readFile(tlsKey) }, handler)
+		: createHttpServer(handler);
+	await new Promise<void>((resolvePromise, reject) => {
+		server.once("error", reject);
+		server.listen(port, host, resolvePromise);
 	});
-	await new Promise<void>((resolvePromise)=>server.listen(port,"127.0.0.1",resolvePromise));
-	return { server, port, close: async()=>{await mcp.close();await new Promise<void>((r)=>server.close(()=>r()));} };
+	return { server, port, host, close: async()=>{await new Promise<void>((r)=>server.close(()=>r()));} };
 }
 
 async function exists(path:string){try{await access(path);return true;}catch{return false;}}
 function strings(value:unknown){return Array.isArray(value)&&value.every((v)=>typeof v==="string")?value:undefined;}
 function json(res:any,status:number,value:unknown){res.writeHead(status,{"content-type":"application/json"});res.end(JSON.stringify(value));}
 async function readJson(req:any):Promise<any>{let data="";for await(const part of req)data+=part;return JSON.parse(data||"{}");}
+async function readOptional(file:string):Promise<string|null>{
+	try{return await readFile(file,"utf8");}
+	catch(error){if((error as {code?:string}).code==="ENOENT")return null;throw error;}
+}
 function parseStoredResult(result: unknown) {
 	if (typeof result !== "string") return result;
 	try { return JSON.parse(result); } catch { return result; }
+}
+function isLoopbackHost(host: string) {
+	const normalized = host.toLowerCase().replace(/^\[|\]$/g, "");
+	if (normalized === "localhost" || normalized.endsWith(".localhost") || normalized === "::1") return true;
+	return isIP(normalized) === 4 && Number(normalized.split(".", 1)[0]) === 127;
+}
+function servesOnlyMcp(host: string) {
+	return !isLoopbackHost(host);
+}
+function hasBearerToken(header: unknown, token: string) {
+	if (typeof header !== "string" || !header.startsWith("Bearer ")) return false;
+	const supplied = Buffer.from(header.slice("Bearer ".length));
+	const expected = Buffer.from(token);
+	return supplied.length === expected.length && timingSafeEqual(supplied, expected);
 }
 function mime(ext:string){return ({".html":"text/html",".js":"text/javascript",".css":"text/css",".svg":"image/svg+xml",".png":"image/png",".woff2":"font/woff2",".json":"application/json"})[ext]??"application/octet-stream";}

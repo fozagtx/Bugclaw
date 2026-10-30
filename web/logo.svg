@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Bugclaw">
+  <path d="M20 4h24l16 16v24L44 60H20L4 44V20z" fill="#2f2e41"/>
+  <path d="M22 44 34 18" stroke="#28E99F" stroke-width="6" stroke-linecap="square"/>
+  <path d="M31 47 43 21" stroke="#28E99F" stroke-width="6" stroke-linecap="square"/>
+  <path d="M40 46 48 29" stroke="#C5FFD6" stroke-width="5" stroke-linecap="square"/>
+</svg>
