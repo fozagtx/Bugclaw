@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -8,7 +8,7 @@ import { Sandbox } from "../src/sandbox.ts";
 import { firstJson, parseChatResponse } from "../src/nebius.ts";
 import { makeSnapshot } from "../src/snapshot.ts";
 import { classify, validateFixFiles, validatePoc } from "../src/repro.ts";
-import { evidencePath } from "../src/evidence.ts";
+import { evidencePath, writeEvidence } from "../src/evidence.ts";
 import { Store } from "../src/store.ts";
 import { config } from "../src/config.ts";
 
@@ -90,7 +90,7 @@ test("SQLite stores candidates, attempts, and human signoffs", async () => {
 	} finally { store.close(); await rm(root, { recursive: true, force: true }); }
 });
 
-test("OpenShell runs a safe command and denies network access", { timeout: 900_000 }, async (t) => {
+test("OpenShell uploads snapshot and PoC at the work root and denies network access", { timeout: 900_000 }, async (t) => {
 	let status: string;
 	try {
 		status = execFileSync("openshell", ["status"], { encoding: "utf8" });
@@ -105,10 +105,26 @@ test("OpenShell runs a safe command and denies network access", { timeout: 900_0
 	const root = await mkdtemp(join(tmpdir(), "bugclaw-sandbox-"));
 	try {
 		const sandbox = new Sandbox();
-		const safe = await sandbox.run(root, [], ["node", "-e", "console.log('BUGCLAW_SAFE')"], 30);
+		const data = join(root, "data");
+		const snapshot = join(data, "scans", "integration", "snapshot");
+		await mkdir(snapshot, { recursive: true });
+		await writeFile(join(snapshot, "lib.js"), "module.exports = () => 42;\n");
+		const poc = {
+			path: ".bugclaw/poc/t.js",
+			content: "const value = require('../../lib.js')();\nif (value === 42) console.log('BUGCLAW_SAFE');\nelse process.exit(1);\n",
+		};
+		const argv = ["node", poc.path];
+		const safe = await sandbox.run(snapshot, [poc], argv, 30);
 		assert.equal(safe.exitCode, 0, safe.stderr);
 		assert.match(safe.stdout, /BUGCLAW_SAFE/);
-		const blocked = await sandbox.run(root, [], ["node", "-e", "const c=new AbortController();setTimeout(()=>c.abort(),5000);fetch('https://example.com',{signal:c.signal}).then(()=>{console.error('EGRESS_ALLOWED');process.exitCode=1}).catch(()=>console.log('EGRESS_BLOCKED'))"], 15);
+		const evidence = await writeEvidence({
+			dataDir: data, scanId: "integration", candidateId: "layout",
+			step: "poc", number: 1, files: [poc], argv, run: safe,
+			meta: { ...safe, classification: "safe" },
+		});
+		execFileSync("sh", [join(evidence, "replay.sh")], { encoding: "utf8", timeout: 120_000 });
+		assert.match(await readFile(join(evidence, "replay.stdout.txt"), "utf8"), /BUGCLAW_SAFE/);
+		const blocked = await sandbox.run(snapshot, [], ["node", "-e", "const c=new AbortController();setTimeout(()=>c.abort(),5000);fetch('https://example.com',{signal:c.signal}).then(()=>{console.error('EGRESS_ALLOWED');process.exitCode=1}).catch(()=>console.log('EGRESS_BLOCKED'))"], 15);
 		assert.equal(blocked.exitCode, 0, blocked.stderr);
 		assert.match(blocked.stdout, /EGRESS_BLOCKED/);
 		assert.doesNotMatch(blocked.stderr, /EGRESS_ALLOWED/);

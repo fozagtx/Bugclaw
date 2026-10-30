@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { resolve, join, dirname, extname, basename, sep } from "node:path";
 import { config } from "./config.ts";
 import { NebiusClient } from "./nebius.ts";
-import { Sandbox, SandboxReadinessError } from "./sandbox.ts";
+import { Sandbox, SandboxError } from "./sandbox.ts";
 import { writeEvidence } from "./evidence.ts";
 import { renderPrompt, type PromptName } from "./prompts.ts";
 import { Store } from "./store.ts";
@@ -88,7 +88,11 @@ export async function reproduce(scanId: string, candidateId?: string, services: 
 				if (classification === "vulnerable") { vulnerableRun = result; break; }
 				vulnerableRun = result;
 			} catch (error) {
-				if (error instanceof SandboxReadinessError) throw error;
+				if (error instanceof SandboxError) {
+					store.attempt(row.id, "poc", { status: "sandbox-error", reason: error.message });
+					status = "sandbox-error";
+					break;
+				}
 				store.attempt(row.id, "poc", { status: "inconclusive", reason: error instanceof Error ? error.message : String(error) });
 			}
 		}
@@ -99,6 +103,13 @@ export async function reproduce(scanId: string, candidateId?: string, services: 
 				CITED_FILES_WITH_LINE_NUMBERS: citedFilesWithLines,
 			});
 			const judgment = await model.complete(cfg.models.judge, judgePrompt.system, judgePrompt.prompt);
+			store.attempt(row.id, "judge", {
+				status: judgment.value.verdict,
+				verdict: judgment.value.verdict,
+				reason: judgment.value.reason,
+				modelId: cfg.models.judge,
+				tokens: { input: judgment.inputTokens, output: judgment.outputTokens },
+			});
 			if (judgment.value.verdict !== "genuine") status = "inconclusive";
 			else {
 				status = "reproduced";
@@ -112,10 +123,15 @@ export async function reproduce(scanId: string, candidateId?: string, services: 
 					});
 					const proposal = await model.complete(cfg.models.fix, prompt.system, prompt.prompt);
 					previousFix = proposal.value;
+					const fixDetails = {
+						summary: proposal.value.summary,
+						modelId: cfg.models.fix,
+						tokens: { input: proposal.inputTokens, output: proposal.outputTokens },
+					};
 					let fixFiles: Array<{ path: string; content: string }>;
 					try { fixFiles = validateFixFiles(proposal.value.files, files); }
 					catch {
-						store.attempt(row.id, "fix", { status: "fix-failed", reason: "fix changes files outside cited source" });
+						store.attempt(row.id, "fix", { status: "fix-failed", reason: "fix changes files outside cited source", ...fixDetails });
 						break;
 					}
 					const patched = await mkdtempForFix();
@@ -127,7 +143,15 @@ export async function reproduce(scanId: string, candidateId?: string, services: 
 							await mkdir(dirname(target), { recursive: true });
 							await writeFile(target, file.content);
 						}
-						const result = await sandbox.run(patched, poc.files, poc.command, 120);
+						let result: Awaited<ReturnType<Sandbox["run"]>>;
+						try {
+							result = await sandbox.run(patched, poc.files, poc.command, 120);
+						} catch (error) {
+							if (!(error instanceof SandboxError)) throw error;
+							store.attempt(row.id, "fix", { status: "sandbox-error", reason: error.message, ...fixDetails });
+							status = "sandbox-error";
+							break;
+						}
 						const diff = await getDiff(snapshot, patched);
 						const classification = classify(result);
 						await writeEvidence({
@@ -136,12 +160,12 @@ export async function reproduce(scanId: string, candidateId?: string, services: 
 							fixDiff: diff,
 						});
 						fixed = classification === "safe";
-						store.attempt(row.id, "fix", { status: fixed ? "fix-verified" : "fix-failed", summary: proposal.value.summary });
+						store.attempt(row.id, "fix", { status: fixed ? "fix-verified" : "fix-failed", ...fixDetails });
 						if (fixed) break;
 						vulnerableRun = result;
 					} finally { await rm(patched, { recursive: true, force: true }); }
 				}
-				status = fixed ? "fix-verified" : "fix-failed";
+				if (status !== "sandbox-error") status = fixed ? "fix-verified" : "fix-failed";
 			}
 		}
 		const stored = JSON.parse(row.data);

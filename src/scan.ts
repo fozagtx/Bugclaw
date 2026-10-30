@@ -35,7 +35,7 @@ export async function scan(options: { source: string; authorization: string; fil
 		await writeFile(scopePath, `${JSON.stringify(scope, null, 2)}\n`, { mode: 0o600 });
 		let exitCode = await runEngine(cfg.engineDir, scopePath, out, progress);
 		if (exitCode === 2) {
-			progress({ type: "log", message: "resuming incomplete secgin run" });
+			progress({ type: "log", message: "resuming incomplete engine run" });
 			exitCode = await runEngine(cfg.engineDir, scopePath, out, progress);
 		}
 		const [report, findings] = await Promise.all([

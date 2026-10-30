@@ -22,6 +22,6 @@ npm start reproduce <scan-id>
 npm start serve --port 8787
 ```
 
-The scanner sends selected source to Nebius Token Factory. The reproduction runner never falls back to host execution and fails closed if OpenShell or Docker is unavailable. Evidence, the SQLite database, and scan snapshots live under `data/`. To start the HTTP API instead, run `npm start serve`; MCP Streamable HTTP is available at `/mcp`. Human signoff is available only through the HTTP API.
+The scanner sends selected source to Nebius Token Factory. Validator-rejected candidates still get a sandbox reproduction, because model validators can be wrong. The reproduction runner never falls back to host execution and fails closed if OpenShell or Docker is unavailable. Evidence, the SQLite database, and scan snapshots live under `data/`. To start the HTTP API instead, run `npm start serve`; MCP Streamable HTTP is available at `/mcp`. Human signoff is available only through the HTTP API.
 
 `npm run test:engine` executes the engine's own test suite. The OpenShell integration test in `npm test` skips only when the local gateway is unavailable.
