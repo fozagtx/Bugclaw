@@ -125,6 +125,17 @@ export async function serve(port = 8787, store = new Store(), options: ServeOpti
 					throw error;
 				}
 			}
+			const scanReport = /^\/api\/scans\/([^/]+)\/report$/.exec(url.pathname);
+			if (req.method === "GET" && scanReport) {
+				const scanId = decodeURIComponent(scanReport[1]!);
+				if (!store.scan(scanId)) return json(res,404,{error:"scan not found"});
+				const output = join(config().dataDir,"scans",scanId,"engine-output");
+				const [markdown,findingsDetail] = await Promise.all([
+					readOptional(join(output,"report.md")),
+					readOptional(join(output,"FINDINGS-DETAIL.md")),
+				]);
+				return json(res,200,{markdown,findingsDetail});
+			}
 			const detail = /^\/api\/scans\/([^/]+)$/.exec(url.pathname);
 			if (req.method === "GET" && detail) {
 				const row = store.scan(decodeURIComponent(detail[1]!)) as any;
@@ -193,6 +204,10 @@ async function exists(path:string){try{await access(path);return true;}catch{ret
 function strings(value:unknown){return Array.isArray(value)&&value.every((v)=>typeof v==="string")?value:undefined;}
 function json(res:any,status:number,value:unknown){res.writeHead(status,{"content-type":"application/json"});res.end(JSON.stringify(value));}
 async function readJson(req:any):Promise<any>{let data="";for await(const part of req)data+=part;return JSON.parse(data||"{}");}
+async function readOptional(file:string):Promise<string|null>{
+	try{return await readFile(file,"utf8");}
+	catch(error){if((error as {code?:string}).code==="ENOENT")return null;throw error;}
+}
 function parseStoredResult(result: unknown) {
 	if (typeof result !== "string") return result;
 	try { return JSON.parse(result); } catch { return result; }

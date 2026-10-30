@@ -5,12 +5,13 @@ import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { Sandbox } from "../src/sandbox.ts";
 import { firstJson, NebiusClient, parseChatResponse } from "../src/nebius.ts";
 import { OUTPUT_SCHEMAS, renderPrompt } from "../src/prompts.ts";
-import { makeSnapshot } from "../src/snapshot.ts";
+import { makeSnapshot, parseGitSource } from "../src/snapshot.ts";
 import { classify, reproduce, validateFixFiles, validatePoc } from "../src/repro.ts";
 import { evidencePath, writeEvidence } from "../src/evidence.ts";
 import { Store } from "../src/store.ts";
@@ -485,6 +486,49 @@ test("source snapshot manifests and hashes are deterministic", async () => {
 		const second = await makeSnapshot(source, join(root, "second"), ["config.ts"]);
 		assert.deepEqual(first.manifest, second.manifest);
 		assert.equal(first.snapshotHash, second.snapshotHash);
+		assert.equal(first.ref, null);
+		assert.equal(first.commit, null);
+	} finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("Git sources validate optional refs and resolve a locally tagged clone", async () => {
+	assert.equal(parseGitSource("https://github.com/owner/repo#2.0.0").ref, "2.0.0");
+	assert.equal(parseGitSource("https://github.com/owner/repo#v1.2.3").ref, "v1.2.3");
+	for (const source of [
+		"https://github.com/owner/repo#-x",
+		"https://github.com/owner/repo#a..b",
+		"https://github.com/owner/repo#",
+		"https://user:password@github.com/owner/repo#2.0.0",
+		"https://github.com/owner/repo?token=secret#2.0.0",
+	]) assert.throws(() => parseGitSource(source));
+
+	const root = await mkdtemp(join(tmpdir(), "bugclaw-git-ref-"));
+	try {
+		const bare = join(root, "repo.git");
+		const work = join(root, "work");
+		await mkdir(work, { recursive: true });
+		execFileSync("git", ["init", "--bare", bare], { stdio: "ignore" });
+		execFileSync("git", ["init", work], { stdio: "ignore" });
+		execFileSync("git", ["-C", work, "config", "user.name", "Bugclaw Test"]);
+		execFileSync("git", ["-C", work, "config", "user.email", "bugclaw-test@example.invalid"]);
+		await writeFile(join(work, "index.js"), "module.exports = 1;\n");
+		execFileSync("git", ["-C", work, "add", "index.js"]);
+		execFileSync("git", ["-C", work, "commit", "-m", "fixture"]);
+		execFileSync("git", ["-C", work, "tag", "v2.0.0"]);
+		execFileSync("git", ["-C", work, "branch", "-M", "main"]);
+		execFileSync("git", ["-C", work, "remote", "add", "origin", bare]);
+		execFileSync("git", ["-C", work, "push", "origin", "main", "v2.0.0"], { stdio: "ignore" });
+		execFileSync("git", ["--git-dir", bare, "symbolic-ref", "HEAD", "refs/heads/main"]);
+		const expectedCommit = execFileSync("git", ["-C", work, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+
+		const url = pathToFileURL(bare).href;
+		const snapshot = await makeSnapshot(`${url}#v2.0.0`, join(root, "tagged"));
+		assert.equal(snapshot.ref, "v2.0.0");
+		assert.equal(snapshot.commit, expectedCommit);
+		assert.deepEqual(snapshot.files, ["index.js"]);
+		const defaultBranch = await makeSnapshot(url, join(root, "default-branch"));
+		assert.equal(defaultBranch.ref, null);
+		assert.equal(defaultBranch.commit, expectedCommit);
 	} finally { await rm(root, { recursive: true, force: true }); }
 });
 
@@ -526,6 +570,8 @@ test("HTTP dashboard and detail APIs use temporary data and serve SPA routes saf
 		const scanDir = join(process.env.BUGCLAW_DATA!, "scans", "scan");
 		const engineOutput = join(scanDir, "engine-output");
 		await mkdir(engineOutput, { recursive: true });
+		await writeFile(join(engineOutput, "report.md"), "# Scan report\nA reviewable result.\n");
+		await writeFile(join(engineOutput, "FINDINGS-DETAIL.md"), "## Findings\nOne finding.\n");
 		await writeFile(join(scanDir, "manifest.json"), JSON.stringify([
 			{ path: "src/app.js", sha256: "abc123" },
 			{ path: "src/lib.js", sha256: "def456" },
@@ -592,6 +638,16 @@ test("HTTP dashboard and detail APIs use temporary data and serve SPA routes saf
 		assert.deepEqual(scan.report, { summary: "complete" });
 		assert.deepEqual(scan.candidates[0].data, { id: "candidate", title: "source candidate", status: "unvalidated", evidence: [] });
 
+		const reportResponse = await fetch(`${base}/api/scans/scan/report`);
+		assert.equal(reportResponse.status, 200);
+		assert.deepEqual(await reportResponse.json(), {
+			markdown: "# Scan report\nA reviewable result.\n",
+			findingsDetail: "## Findings\nOne finding.\n",
+		});
+		const emptyReportResponse = await fetch(`${base}/api/scans/empty/report`);
+		assert.equal(emptyReportResponse.status, 200);
+		assert.deepEqual(await emptyReportResponse.json(), { markdown: null, findingsDetail: null });
+
 		const activityResponse = await fetch(`${base}/api/scans/scan/activity`);
 		assert.equal(activityResponse.status, 200);
 		const activity = await activityResponse.json() as any;
@@ -623,6 +679,9 @@ test("HTTP dashboard and detail APIs use temporary data and serve SPA routes saf
 		const unknownActivity = await fetch(`${base}/api/scans/missing/activity`);
 		assert.equal(unknownActivity.status, 404);
 		assert.deepEqual(await unknownActivity.json(), { error: "scan not found" });
+		const unknownReport = await fetch(`${base}/api/scans/missing/report`);
+		assert.equal(unknownReport.status, 404);
+		assert.deepEqual(await unknownReport.json(), { error: "scan not found" });
 	} finally {
 		if (service) await service.close();
 		store?.close();
