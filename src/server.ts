@@ -15,6 +15,7 @@ import { reproduce } from "./repro.ts";
 import { Store } from "./store.ts";
 import { evidencePath } from "./evidence.ts";
 import { runnerImageTag } from "./sandbox.ts";
+import { EngineStateBusyError, scanActivity } from "./activity.ts";
 
 const exec = promisify(execFile);
 const events = new Map<string, EventEmitter>();
@@ -85,6 +86,17 @@ export async function serve(port = 8787, store = new Store()) {
 				emitter?.on("event",listener);
 				req.on("close",()=>emitter?.off("event",listener));
 				return;
+			}
+			const activity = /^\/api\/scans\/([^/]+)\/activity$/.exec(url.pathname);
+			if (req.method === "GET" && activity) {
+				const scanId = decodeURIComponent(activity[1]!);
+				if (!store.scan(scanId)) return json(res,404,{error:"scan not found"});
+				try {
+					return json(res,200,scanActivity(config().dataDir,scanId));
+				} catch (error) {
+					if (error instanceof EngineStateBusyError) return json(res,503,{error:"engine state busy, retry"});
+					throw error;
+				}
 			}
 			const detail = /^\/api\/scans\/([^/]+)$/.exec(url.pathname);
 			if (req.method === "GET" && detail) {

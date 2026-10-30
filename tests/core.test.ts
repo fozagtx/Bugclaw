@@ -4,6 +4,7 @@ import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promise
 import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { Sandbox } from "../src/sandbox.ts";
 import { firstJson, NebiusClient, parseChatResponse } from "../src/nebius.ts";
@@ -272,6 +273,21 @@ test("HTTP dashboard and detail APIs use temporary data and serve SPA routes saf
 		store.attempt("candidate", "poc", { status: "not-reproduced" });
 		store.attempt("candidate", "unparseable", { status: "temporary" });
 		store.db.prepare("UPDATE attempts SET result=? WHERE step=?").run("not-json", "unparseable");
+		const scanDir = join(process.env.BUGCLAW_DATA!, "scans", "scan");
+		const engineOutput = join(scanDir, "engine-output");
+		await mkdir(engineOutput, { recursive: true });
+		await writeFile(join(scanDir, "manifest.json"), JSON.stringify([
+			{ path: "src/app.js", sha256: "abc123" },
+			{ path: "src/lib.js", sha256: "def456" },
+		]));
+		const engineDb = new DatabaseSync(join(engineOutput, "state.sqlite"));
+		engineDb.exec("CREATE TABLE tasks (id TEXT, stage TEXT, attempts INTEGER, status TEXT, result TEXT, error TEXT)");
+		const insertTask = engineDb.prepare("INSERT INTO tasks (id, stage, attempts, status, result, error) VALUES (?, ?, ?, ?, ?, ?)");
+		insertTask.run("recon-1", "recon:architecture", 1, "done", JSON.stringify({ value: { summary: "r".repeat(650) }, tools: [], inputTokens: 11, outputTokens: 12 }), null);
+		insertTask.run("hunt-1", "hunt:web2:identity:0", 2, "done", JSON.stringify({ value: { coverage: "identity and access checks", findings: [{}] }, tools: [], inputTokens: 21, outputTokens: 22 }), null);
+		insertTask.run("validate-1", "validate:candidate-1", 1, "done", JSON.stringify({ value: { verdict: "genuine", reason: "The candidate is supported." }, tools: [], inputTokens: 31, outputTokens: 32 }), null);
+		insertTask.run("failed-1", "hunt:web2:failed:0", 1, "failed", null, "model output failed");
+		engineDb.close();
 
 		service = await serve(0, store);
 		const address = service.server.address();
@@ -326,9 +342,37 @@ test("HTTP dashboard and detail APIs use temporary data and serve SPA routes saf
 		assert.deepEqual(scan.report, { summary: "complete" });
 		assert.deepEqual(scan.candidates[0].data, { id: "candidate", title: "source candidate", status: "unvalidated", evidence: [] });
 
+		const activityResponse = await fetch(`${base}/api/scans/scan/activity`);
+		assert.equal(activityResponse.status, 200);
+		const activity = await activityResponse.json() as any;
+		assert.deepEqual(activity.files, [
+			{ path: "src/app.js", sha256: "abc123" },
+			{ path: "src/lib.js", sha256: "def456" },
+		]);
+		assert.deepEqual(activity.tasks.map((task: any) => task.id), ["recon-1", "hunt-1", "validate-1", "failed-1"]);
+		assert.deepEqual(activity.tasks[0], {
+			id: "recon-1", stage: "recon:architecture", status: "done", attempts: 1, error: null,
+			summary: "r".repeat(600), findings: null, verdict: null, inputTokens: 11, outputTokens: 12,
+		});
+		assert.deepEqual(activity.tasks[1], {
+			id: "hunt-1", stage: "hunt:web2:identity:0", status: "done", attempts: 2, error: null,
+			summary: "identity and access checks", findings: 1, verdict: null, inputTokens: 21, outputTokens: 22,
+		});
+		assert.deepEqual(activity.tasks[2], {
+			id: "validate-1", stage: "validate:candidate-1", status: "done", attempts: 1, error: null,
+			summary: "The candidate is supported.", findings: null, verdict: "genuine", inputTokens: 31, outputTokens: 32,
+		});
+		assert.deepEqual(activity.tasks[3], {
+			id: "failed-1", stage: "hunt:web2:failed:0", status: "failed", attempts: 1, error: "model output failed",
+			summary: null, findings: null, verdict: null, inputTokens: null, outputTokens: null,
+		});
+
 		const unknownScan = await fetch(`${base}/api/scans/missing`);
 		assert.equal(unknownScan.status, 404);
 		assert.deepEqual(await unknownScan.json(), { error: "scan not found" });
+		const unknownActivity = await fetch(`${base}/api/scans/missing/activity`);
+		assert.equal(unknownActivity.status, 404);
+		assert.deepEqual(await unknownActivity.json(), { error: "scan not found" });
 	} finally {
 		if (service) await service.close();
 		store?.close();
