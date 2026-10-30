@@ -24,4 +24,14 @@ npm start serve --port 8787
 
 The scanner sends selected source to Nebius Token Factory. Validator-rejected candidates still get a sandbox reproduction, because model validators can be wrong. Terminal reproduction statuses are `reproduced`, `fix-verified`, `fix-failed`, `not-reproduced`, `not-reproducible`, `invalid-poc`, `model-error`, and `sandbox-error`. The reproduction runner never falls back to host execution and fails closed if OpenShell or Docker is unavailable. Evidence, the SQLite database, and scan snapshots live under `data/`. To start the HTTP API instead, run `npm start serve`; MCP Streamable HTTP is available at `/mcp`. Human signoff is available only through the HTTP API.
 
+## NemoClaw
+
+```sh
+export BUGCLAW_MCP_TOKEN=$(openssl rand -hex 32)
+bugclaw serve --host 172.16.255.2 --port 8443 --tls-cert cert.pem --tls-key key.pem
+nemoclaw <sandbox> mcp add bugclaw --url https://172.16.255.2:8443/mcp --env BUGCLAW_MCP_TOKEN --trusted-private-host 172.16.255.2
+```
+
+The certificate must carry an IP SAN for `172.16.255.2`, and its CA must be supplied with `NEMOCLAW_CORPORATE_CA_BUNDLE` at onboarding.
+
 `npm run test:engine` executes the engine's own test suite. The OpenShell integration test in `npm test` skips only when the local gateway is unavailable.

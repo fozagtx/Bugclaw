@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -72,6 +73,135 @@ test("Bugclaw defaults to public Nebius Token Factory models and supports overri
 	assert.equal(defaults.models.judge, defaults.models.validator);
 	assert.equal(defaults.models.fix, defaults.models.validator);
 	assert.equal(config({ NEBIUS_BASE_URL: "https://example.invalid/v1/" }).baseUrl, "https://example.invalid/v1");
+	assert.throws(
+		() => config({ BUGCLAW_RECON_MODEL: "nebius/openai/gpt-oss-120b" }),
+		/Bugclaw only runs NVIDIA Nemotron models on Nebius Token Factory: nebius\/openai\/gpt-oss-120b/,
+	);
+	assert.equal(
+		config({ BUGCLAW_RECON_MODEL: "nebius/nvidia/nemotron-3-super-120b-a12b" }).models.recon,
+		"nebius/nvidia/nemotron-3-super-120b-a12b",
+	);
+});
+
+test("MCP bearer authentication and non-loopback binding require the configured token", async () => {
+	const root = await mkdtemp(join(tmpdir(), "bugclaw-mcp-"));
+	const previousData = process.env.BUGCLAW_DATA;
+	const previousToken = process.env.BUGCLAW_MCP_TOKEN;
+	let store: Store | undefined;
+	let protectedService: Awaited<ReturnType<typeof serve>> | undefined;
+	let unprotectedService: Awaited<ReturnType<typeof serve>> | undefined;
+	const initializeBody = JSON.stringify({
+		jsonrpc: "2.0",
+		id: 1,
+		method: "initialize",
+		params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "Bugclaw test", version: "1.0.0" } },
+	});
+	try {
+		process.env.BUGCLAW_DATA = join(root, "data");
+		process.env.BUGCLAW_MCP_TOKEN = "expected-secret";
+		store = new Store();
+		protectedService = await serve(0, store);
+		const protectedAddress = protectedService.server.address();
+		assert.ok(protectedAddress && typeof protectedAddress !== "string");
+		const postInitialize = (port: number, authorization?: string) => fetch(`http://127.0.0.1:${port}/mcp`, {
+			method: "POST",
+			headers: {
+				accept: "application/json, text/event-stream",
+				"content-type": "application/json",
+				...(authorization ? { authorization } : {}),
+			},
+			body: initializeBody,
+		});
+		const missing = await postInitialize(protectedAddress.port);
+		assert.equal(missing.status, 401);
+		assert.equal(missing.headers.get("www-authenticate"), "Bearer");
+		assert.deepEqual(await missing.json(), { error: "unauthorized" });
+		const wrong = await postInitialize(protectedAddress.port, "Bearer wrong-secret");
+		assert.equal(wrong.status, 401);
+		assert.equal(wrong.headers.get("www-authenticate"), "Bearer");
+		assert.deepEqual(await wrong.json(), { error: "unauthorized" });
+		const authorized = await postInitialize(protectedAddress.port, "Bearer expected-secret");
+		assert.notEqual(authorized.status, 401);
+		await authorized.text();
+
+		delete process.env.BUGCLAW_MCP_TOKEN;
+		await assert.rejects(
+			serve(0, store, { host: "0.0.0.0" }),
+			/BUGCLAW_MCP_TOKEN is required to bind a non-loopback host/,
+		);
+		unprotectedService = await serve(0, store);
+		const unprotectedAddress = unprotectedService.server.address();
+		assert.ok(unprotectedAddress && typeof unprotectedAddress !== "string");
+		const unauthenticated = await postInitialize(unprotectedAddress.port);
+		assert.notEqual(unauthenticated.status, 401);
+		await unauthenticated.text();
+	} finally {
+		if (unprotectedService) await unprotectedService.close();
+		if (protectedService) await protectedService.close();
+		store?.close();
+		if (previousData === undefined) delete process.env.BUGCLAW_DATA;
+		else process.env.BUGCLAW_DATA = previousData;
+		if (previousToken === undefined) delete process.env.BUGCLAW_MCP_TOKEN;
+		else process.env.BUGCLAW_MCP_TOKEN = previousToken;
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("HTTPS serving uses the provided certificate and key", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "bugclaw-https-"));
+	const previousData = process.env.BUGCLAW_DATA;
+	const previousApiKey = process.env.NEBIUS_API_KEY;
+	let store: Store | undefined;
+	let service: Awaited<ReturnType<typeof serve>> | undefined;
+	try {
+		try {
+			execFileSync("openssl", ["version"], { stdio: "ignore" });
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+				t.skip("openssl is unavailable");
+				return;
+			}
+			throw error;
+		}
+		process.env.BUGCLAW_DATA = join(root, "data");
+		delete process.env.NEBIUS_API_KEY;
+		const certPath = join(root, "cert.pem");
+		const keyPath = join(root, "key.pem");
+		execFileSync("openssl", [
+			"req", "-x509", "-newkey", "rsa:2048", "-nodes",
+			"-keyout", keyPath, "-out", certPath, "-days", "1",
+			"-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1",
+		], { stdio: "ignore" });
+		store = new Store();
+		service = await serve(0, store, { host: "127.0.0.1", tlsCert: certPath, tlsKey: keyPath });
+		const address = service.server.address();
+		assert.ok(address && typeof address !== "string");
+		const response = await new Promise<{ status: number | undefined; body: string }>((resolveResponse, reject) => {
+			const request = httpsRequest({
+				hostname: "127.0.0.1",
+				port: address.port,
+				path: "/api/health",
+				rejectUnauthorized: false,
+			}, (incoming) => {
+				let body = "";
+				incoming.setEncoding("utf8");
+				incoming.on("data", (part: string) => { body += part; });
+				incoming.on("end", () => resolveResponse({ status: incoming.statusCode, body }));
+			});
+			request.on("error", reject);
+			request.end();
+		});
+		assert.equal(response.status, 200);
+		assert.ok(response.body.length > 0);
+	} finally {
+		if (service) await service.close();
+		store?.close();
+		if (previousData === undefined) delete process.env.BUGCLAW_DATA;
+		else process.env.BUGCLAW_DATA = previousData;
+		if (previousApiKey === undefined) delete process.env.NEBIUS_API_KEY;
+		else process.env.NEBIUS_API_KEY = previousApiKey;
+		await rm(root, { recursive: true, force: true });
+	}
 });
 
 test("Nebius JSON parsing accepts leading newlines and null tool_calls", () => {
