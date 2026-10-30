@@ -62,7 +62,7 @@ License
 
 ## Demo
 
-**Working demo / test build:** `https://YOUR-DEMO-URL-HERE` _← replace with your hosted dashboard or a recorded walkthrough before submitting; see “Running the demo locally” for the fastest way to host one._
+**Working demo / test build:** [`https://bugclaw-qy4i.onrender.com`](https://bugclaw-qy4i.onrender.com) _← the live hosted dashboard on Render (free instance; spins down after inactivity and wakes with a ~50s delay). To run it yourself locally, see “Running the demo locally” below._
 
 To run the demo yourself on any machine:
 
