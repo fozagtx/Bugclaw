@@ -1,4 +1,5 @@
 node_modules/
 data/
-web/dist/
 *.sqlite
+.env
+.env.*
