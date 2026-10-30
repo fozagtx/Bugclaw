@@ -7,6 +7,8 @@ Contract:
 - If the code behaves safely, the test prints a line containing BUGCLAW_SAFE and exits with code 0.
 - Any other outcome (crash, missing dependency, timeout) is inconclusive; avoid it.
 - Runtime available in the sandbox: \${RUNTIMES}. No network, so no package installs; use only the standard library and dependencies already present in the snapshot.
+- The snapshot's third-party dependencies are NOT installed and there is no network, so a require/import of any package that is not in the snapshot itself will fail. Never substitute a stub, mock, fake or hand-written replacement for a dependency, a database, or any part of the snapshot's own logic: a test whose result comes from your replacement proves nothing and will be rejected.
+- If the candidate cannot be proven this way (it needs an uninstalled dependency, a live service, or a database), do not write a test. Return {"cannotReproduce": "<one sentence naming exactly what is missing>"} as the entire JSON object instead.
 - Working directory is the snapshot root. Put every file you create under .bugclaw/poc/ (paths relative to the snapshot root). Snapshot files keep their paths, so load them by absolute path from the working directory, e.g. require(require("path").resolve(process.cwd(), "src/app.js")), never by a guessed relative path.
 - Each file's content is the raw file text with real line breaks; never write newlines as the two characters \\n.
 - Keep it under 120 lines and under 60 seconds of runtime.
@@ -55,14 +57,24 @@ const fileSchema = {
 const pocSchema: OutputSchema = {
 	name: "bugclaw_poc",
 	schema: {
-		type: "object",
-		additionalProperties: false,
-		properties: {
-			files: { type: "array", minItems: 1, maxItems: 3, items: fileSchema },
-			command: { type: "array", minItems: 1, items: { type: "string" } },
-			rationale: { type: "string" },
-		},
-		required: ["files", "command", "rationale"],
+		anyOf: [
+			{
+				type: "object",
+				additionalProperties: false,
+				properties: {
+					files: { type: "array", minItems: 1, maxItems: 3, items: fileSchema },
+					command: { type: "array", minItems: 1, items: { type: "string" } },
+					rationale: { type: "string" },
+				},
+				required: ["files", "command", "rationale"],
+			},
+			{
+				type: "object",
+				properties: { cannotReproduce: { type: "string" } },
+				required: ["cannotReproduce"],
+				additionalProperties: false,
+			},
+		],
 	},
 };
 const judgeSchema: OutputSchema = {

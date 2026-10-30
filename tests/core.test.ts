@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -9,11 +9,57 @@ import { Sandbox } from "../src/sandbox.ts";
 import { firstJson, NebiusClient, parseChatResponse } from "../src/nebius.ts";
 import { OUTPUT_SCHEMAS, renderPrompt } from "../src/prompts.ts";
 import { makeSnapshot } from "../src/snapshot.ts";
-import { classify, validateFixFiles, validatePoc } from "../src/repro.ts";
+import { classify, reproduce, validateFixFiles, validatePoc } from "../src/repro.ts";
 import { evidencePath, writeEvidence } from "../src/evidence.ts";
 import { Store } from "../src/store.ts";
 import { config } from "../src/config.ts";
 import { serve } from "../src/server.ts";
+
+async function makeReproFixture() {
+	const root = await mkdtemp(join(tmpdir(), "bugclaw-repro-"));
+	const dataDir = join(root, "data");
+	const scanId = "repro-fixture";
+	const candidateId = "candidate-fixture";
+	const previousData = process.env.BUGCLAW_DATA;
+	const previousKey = process.env.NEBIUS_API_KEY;
+	process.env.BUGCLAW_DATA = dataDir;
+	process.env.NEBIUS_API_KEY = "unit-test-key";
+	let store: Store | undefined;
+	try {
+		store = new Store(join(dataDir, "bugclaw.sqlite"));
+		const scanDir = join(dataDir, "scans", scanId);
+		const sourceDir = join(scanDir, "snapshot", "src");
+		await mkdir(sourceDir, { recursive: true });
+		await writeFile(join(sourceDir, "main.js"), "module.exports = {};\n");
+		await writeFile(join(scanDir, "manifest.json"), JSON.stringify([{ path: "src/main.js" }]));
+		store.createScan({ id: scanId, source: "fixture", authorization: "unit test" });
+		store.setScan(scanId, "done", "fixture-hash", {});
+		store.putCandidate(scanId, {
+			id: candidateId,
+			title: "fixture candidate",
+			evidence: [{ path: "src/main.js", startLine: 1, endLine: 1, quote: "module.exports = {};" }],
+		});
+	} catch (error) {
+		store?.close();
+		if (previousData === undefined) delete process.env.BUGCLAW_DATA;
+		else process.env.BUGCLAW_DATA = previousData;
+		if (previousKey === undefined) delete process.env.NEBIUS_API_KEY;
+		else process.env.NEBIUS_API_KEY = previousKey;
+		await rm(root, { recursive: true, force: true });
+		throw error;
+	}
+	return {
+		root, dataDir, scanId, candidateId, store: store!,
+		async cleanup() {
+			store!.close();
+			if (previousData === undefined) delete process.env.BUGCLAW_DATA;
+			else process.env.BUGCLAW_DATA = previousData;
+			if (previousKey === undefined) delete process.env.NEBIUS_API_KEY;
+			else process.env.NEBIUS_API_KEY = previousKey;
+			await rm(root, { recursive: true, force: true });
+		},
+	};
+}
 
 test("Bugclaw defaults to public Nebius Token Factory models and supports overrides", () => {
 	const defaults = config({});
@@ -57,6 +103,11 @@ test("Nebius PoC requests use strict JSON Schema response formatting", async () 
 		type: "json_schema",
 		json_schema: { name: OUTPUT_SCHEMAS.POC.name, strict: true, schema: OUTPUT_SCHEMAS.POC.schema },
 	});
+	const schema = OUTPUT_SCHEMAS.POC.schema as any;
+	assert.equal(schema.anyOf.length, 2);
+	assert.deepEqual(schema.anyOf[1].required, ["cannotReproduce"]);
+	assert.equal(schema.anyOf[1].additionalProperties, false);
+	assert.deepEqual(OUTPUT_SCHEMAS.POC_RETRY.schema, OUTPUT_SCHEMAS.POC.schema);
 });
 
 test("POC classification requires both the marker and its specified exit code", () => {
@@ -121,6 +172,8 @@ test("POC relative imports must resolve to a PoC or snapshot file", () => {
 test("POC_RETRY renders the previous contract error", () => {
 	const prompt = renderPrompt("POC_RETRY", { CONTRACT_ERROR: "missing import", SANDBOX_RESULT: { notRun: true } }).prompt;
 	assert.ok(prompt.includes('SANDBOX_RESULT={"notRun":true}\nCONTRACT_ERROR="missing import"'));
+	assert.match(renderPrompt("POC", {}).prompt, /Never substitute a stub, mock, fake or hand-written replacement/);
+	assert.match(renderPrompt("POC", {}).prompt, /Return \{"cannotReproduce":/);
 });
 
 test("POC validation repairs escaped file text once and preserves files with real newlines", () => {
@@ -284,6 +337,111 @@ test("HTTP dashboard and detail APIs use temporary data and serve SPA routes saf
 		else process.env.BUGCLAW_DATA = previousData;
 		await rm(root, { recursive: true, force: true });
 	}
+});
+
+test("cannotReproduce ends without running a sandbox or writing evidence", async () => {
+	const fixture = await makeReproFixture();
+	const reason = "The snapshot does not include the mysql package.";
+	let modelCalls = 0;
+	let sandboxRuns = 0;
+	const model = {
+		async complete() {
+			modelCalls++;
+			return { value: { cannotReproduce: reason }, inputTokens: 5, outputTokens: 7 };
+		},
+	};
+	const sandbox = {
+		async run() {
+			sandboxRuns++;
+			return { exitCode: 0, stdout: "BUGCLAW_SAFE", stderr: "", timedOut: false };
+		},
+	};
+	try {
+		const output = await reproduce(fixture.scanId, fixture.candidateId, { store: fixture.store, model, sandbox } as any);
+		assert.equal(output[0].status, "not-reproducible");
+		assert.equal(output[0].reason, reason);
+		assert.equal(modelCalls, 1);
+		assert.equal(sandboxRuns, 0);
+		const candidate = fixture.store.candidate(fixture.candidateId);
+		assert.equal(candidate.status, "not-reproducible");
+		assert.equal(JSON.parse(candidate.data).reproReason, reason);
+		const attempts = fixture.store.attempts(fixture.candidateId) as any[];
+		assert.equal(attempts.length, 1);
+		assert.equal(attempts[0].step, "poc");
+		assert.deepEqual(JSON.parse(attempts[0].result), { status: "not-reproducible", reason });
+		await assert.rejects(access(join(fixture.dataDir, "scans", fixture.scanId, "evidence", fixture.candidateId)), { code: "ENOENT" });
+	} finally { await fixture.cleanup(); }
+});
+
+test("model errors retry the same PoC attempt and terminate as model-error", async () => {
+	const fixture = await makeReproFixture();
+	const reason = "Nebius returned an incomplete or tool-bearing response";
+	let modelCalls = 0;
+	let sandboxRuns = 0;
+	const model = {
+		async complete() {
+			modelCalls++;
+			throw new Error(reason);
+		},
+	};
+	const sandbox = {
+		async run() {
+			sandboxRuns++;
+			return { exitCode: 0, stdout: "", stderr: "", timedOut: false };
+		},
+	};
+	try {
+		const output = await reproduce(fixture.scanId, fixture.candidateId, { store: fixture.store, model, sandbox } as any);
+		assert.equal(modelCalls, 3);
+		assert.equal(sandboxRuns, 0);
+		assert.equal(output[0].status, "model-error");
+		assert.equal(output[0].reason, reason);
+		const candidate = fixture.store.candidate(fixture.candidateId);
+		assert.equal(candidate.status, "model-error");
+		assert.equal(JSON.parse(candidate.data).reproReason, reason);
+		const attempts = fixture.store.attempts(fixture.candidateId) as any[];
+		assert.equal(attempts.length, 1);
+		assert.deepEqual(JSON.parse(attempts[0].result), { status: "model-error", reason });
+	} finally { await fixture.cleanup(); }
+});
+
+test("a final PoC validation failure terminates as invalid-poc with its contract error", async () => {
+	const fixture = await makeReproFixture();
+	let modelCalls = 0;
+	let sandboxRuns = 0;
+	const model = {
+		async complete() {
+			modelCalls++;
+			return {
+				value: {
+					files: [{ path: ".bugclaw/poc/test.js", content: "require(require('path').resolve(process.cwd(), 'src/main.js'))" }],
+					command: [".bugclaw/poc/test.js"],
+					rationale: "exercise src/main.js",
+				},
+				inputTokens: 5,
+				outputTokens: 7,
+			};
+		},
+	};
+	const sandbox = {
+		async run() {
+			sandboxRuns++;
+			return { exitCode: 0, stdout: "BUGCLAW_SAFE", stderr: "", timedOut: false };
+		},
+	};
+	try {
+		const output = await reproduce(fixture.scanId, fixture.candidateId, { store: fixture.store, model, sandbox } as any);
+		assert.equal(modelCalls, 3);
+		assert.equal(sandboxRuns, 0);
+		assert.equal(output[0].status, "invalid-poc");
+		assert.equal(output[0].reason, "invalid PoC command");
+		const candidate = fixture.store.candidate(fixture.candidateId);
+		assert.equal(candidate.status, "invalid-poc");
+		assert.equal(JSON.parse(candidate.data).reproReason, "invalid PoC command");
+		const attempts = fixture.store.attempts(fixture.candidateId) as any[];
+		assert.equal(attempts.length, 3);
+		assert.deepEqual(JSON.parse(attempts.at(-1).result), { status: "invalid", reason: "invalid PoC command" });
+	} finally { await fixture.cleanup(); }
 });
 
 test("OpenShell uploads snapshot and PoC at the work root and denies network access", { timeout: 900_000 }, async (t) => {

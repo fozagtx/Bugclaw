@@ -101,8 +101,11 @@ export async function reproduce(scanId: string, candidateId?: string, services: 
 		const raw = JSON.parse(row.data);
 		const files = cited(raw);
 		if (!files.length) {
-			store.attempt(row.id, "poc", { status: "inconclusive", reason: "candidate has no cited source files" });
-			output.push({ candidateId: row.id, status: "inconclusive", attempts: 0 });
+			const reason = "candidate has no cited source files";
+			store.attempt(row.id, "poc", { status: "not-reproducible", reason });
+			const stored = { ...raw, reproStatus: "not-reproducible", reproReason: reason };
+			store.setCandidateStatus(row.id, "not-reproducible", stored);
+			output.push({ candidateId: row.id, status: "not-reproducible", attempts: store.attempts(row.id).length, reason });
 			continue;
 		}
 		const snapshot = join(cfg.dataDir, "scans", scanId, "snapshot");
@@ -113,7 +116,8 @@ export async function reproduce(scanId: string, candidateId?: string, services: 
 		let vulnerableRun: any = null;
 		let contractError = "none";
 		let retrySandboxResult: unknown = { notRun: true };
-		let status = "inconclusive";
+		let status = "not-reproducible";
+		let terminalReason: string | undefined;
 		for (let n = 1; n <= 3; n++) {
 			const started = new Date().toISOString();
 			try {
@@ -126,14 +130,43 @@ export async function reproduce(scanId: string, candidateId?: string, services: 
 					SANDBOX_RESULT: retrySandboxResult,
 					CONTRACT_ERROR: contractError,
 				});
-				const generated = await model.complete(cfg.models.repro, prompt.system, prompt.prompt, OUTPUT_SCHEMAS[promptName]);
+				let generated: any;
+				let modelCallSucceeded = false;
+				let modelCallError: unknown;
+				for (let retry = 0; retry < 3; retry++) {
+					try {
+						generated = await model.complete(cfg.models.repro, prompt.system, prompt.prompt, OUTPUT_SCHEMAS[promptName]);
+						modelCallSucceeded = true;
+						break;
+					} catch (error) {
+						modelCallError = error;
+					}
+				}
+				if (!modelCallSucceeded) {
+					terminalReason = modelCallError instanceof Error ? modelCallError.message : String(modelCallError);
+					status = "model-error";
+					store.attempt(row.id, "poc", { status, reason: terminalReason });
+					break;
+				}
+				terminalReason = undefined;
 				poc = generated.value;
+				if (poc && typeof poc === "object" && !Array.isArray(poc) && Object.keys(poc).length === 1 && typeof poc.cannotReproduce === "string" && poc.cannotReproduce.trim()) {
+					terminalReason = poc.cannotReproduce;
+					status = "not-reproducible";
+					store.attempt(row.id, "poc", { status, reason: terminalReason });
+					break;
+				}
 				try {
 					pocRepair = validatePoc(poc, files, snapshotFiles);
 				} catch (error) {
 					contractError = error instanceof Error ? error.message : String(error);
 					retrySandboxResult = { notRun: true };
 					store.attempt(row.id, "poc", { status: "invalid", reason: contractError });
+					if (n === 3) {
+						status = "invalid-poc";
+						terminalReason = contractError;
+						break;
+					}
 					continue;
 				}
 				const result = await sandbox.run(snapshot, poc.files, poc.command, 120);
@@ -145,16 +178,19 @@ export async function reproduce(scanId: string, candidateId?: string, services: 
 					meta: { snapshotHash: (store.scan(scanId) as any)?.snapshot_hash, ...result, modelId: cfg.models.repro, tokens: { input: generated.inputTokens, output: generated.outputTokens }, classification, ...(pocRepair ? { repaired: pocRepair } : {}), startedAt: started, endedAt: new Date().toISOString() },
 				});
 				store.attempt(row.id, "poc", { status: classification, evidence });
-				if (classification === "safe") { status = "not-reproduced"; break; }
+				if (classification === "safe") { status = "not-reproduced"; terminalReason = undefined; break; }
 				if (classification === "vulnerable") { vulnerableRun = result; break; }
+				terminalReason = "PoC execution did not produce a decisive vulnerability or safe marker";
 				vulnerableRun = result;
 			} catch (error) {
 				if (error instanceof SandboxError) {
 					store.attempt(row.id, "poc", { status: "sandbox-error", reason: error.message });
 					status = "sandbox-error";
+					terminalReason = error.message;
 					break;
 				}
-				store.attempt(row.id, "poc", { status: "inconclusive", reason: error instanceof Error ? error.message : String(error) });
+				terminalReason = error instanceof Error ? error.message : String(error);
+				store.attempt(row.id, "poc", { status: "inconclusive", reason: terminalReason });
 			}
 		}
 		if (vulnerableRun && classify(vulnerableRun) === "vulnerable") {
@@ -171,9 +207,13 @@ export async function reproduce(scanId: string, candidateId?: string, services: 
 				modelId: cfg.models.judge,
 				tokens: { input: judgment.inputTokens, output: judgment.outputTokens },
 			});
-			if (judgment.value.verdict !== "genuine") status = "inconclusive";
+			if (judgment.value.verdict !== "genuine") {
+				status = "not-reproducible";
+				terminalReason = judgment.value.reason;
+			}
 			else {
 				status = "reproduced";
+				terminalReason = undefined;
 				let fixed = false;
 				let previousFix: unknown = null;
 				for (let attempt = 0; attempt < 2; attempt++) {
@@ -236,8 +276,10 @@ export async function reproduce(scanId: string, candidateId?: string, services: 
 		}
 		const stored = JSON.parse(row.data);
 		stored.reproStatus = status;
+		if (terminalReason) stored.reproReason = terminalReason;
+		else delete stored.reproReason;
 		store.setCandidateStatus(row.id, status, stored);
-		output.push({ candidateId: row.id, status, attempts: store.attempts(row.id).length });
+		output.push({ candidateId: row.id, status, attempts: store.attempts(row.id).length, ...(terminalReason ? { reason: terminalReason } : {}) });
 	}
 	return output;
 }
