@@ -7,7 +7,8 @@ Contract:
 - If the code behaves safely, the test prints a line containing BUGCLAW_SAFE and exits with code 0.
 - Any other outcome (crash, missing dependency, timeout) is inconclusive; avoid it.
 - Runtime available in the sandbox: \${RUNTIMES}. No network, so no package installs; use only the standard library and dependencies already present in the snapshot.
-- Working directory is the snapshot root. Put every file you create under .bugclaw/poc/. Paths are relative to the snapshot root.
+- Working directory is the snapshot root. Put every file you create under .bugclaw/poc/ (paths relative to the snapshot root). Snapshot files keep their paths, so load them by absolute path from the working directory, e.g. require(require("path").resolve(process.cwd(), "src/app.js")), never by a guessed relative path.
+- Each file's content is the raw file text with real line breaks; never write newlines as the two characters \\n.
 - Keep it under 120 lines and under 60 seconds of runtime.
 Keys: files[{path,content}] (1-3 files), command (string[]; argv, no shell), rationale (string: which cited code path the test exercises and how the result proves or disproves the candidate).
 CANDIDATE_DATA=\${CANDIDATE_JSON}
@@ -41,6 +42,60 @@ SOURCE_DATA=\${CITED_FILES_FULL}`;
 
 export const RUNTIMES = "node 22, python 3.11, forge/anvil (Foundry)";
 export type PromptName = "POC" | "POC_RETRY" | "JUDGE" | "FIX" | "FIX_RETRY";
+type OutputSchema = { name: string; schema: Record<string, unknown> };
+
+const fileSchema = {
+	type: "object",
+	additionalProperties: false,
+	properties: { path: { type: "string" }, content: { type: "string" } },
+	required: ["path", "content"],
+};
+const pocSchema: OutputSchema = {
+	name: "bugclaw_poc",
+	schema: {
+		type: "object",
+		additionalProperties: false,
+		properties: {
+			files: { type: "array", minItems: 1, maxItems: 3, items: fileSchema },
+			command: { type: "array", minItems: 1, items: { type: "string" } },
+			rationale: { type: "string" },
+		},
+		required: ["files", "command", "rationale"],
+	},
+};
+const judgeSchema: OutputSchema = {
+	name: "bugclaw_judge",
+	schema: {
+		type: "object",
+		additionalProperties: false,
+		properties: {
+			verdict: { type: "string", enum: ["genuine", "tautological", "unclear"] },
+			reason: { type: "string" },
+		},
+		required: ["verdict", "reason"],
+	},
+};
+const fixSchema: OutputSchema = {
+	name: "bugclaw_fix",
+	schema: {
+		type: "object",
+		additionalProperties: false,
+		properties: {
+			files: { type: "array", minItems: 1, items: fileSchema },
+			summary: { type: "string" },
+		},
+		required: ["files", "summary"],
+	},
+};
+
+export const OUTPUT_SCHEMAS: Record<PromptName, OutputSchema> = {
+	POC: pocSchema,
+	POC_RETRY: pocSchema,
+	JUDGE: judgeSchema,
+	FIX: fixSchema,
+	FIX_RETRY: fixSchema,
+};
+
 export function renderPrompt(name: PromptName, variables: Record<string, unknown>): { system: string; prompt: string } {
 	const templates = { POC, POC_RETRY, JUDGE, FIX, FIX_RETRY };
 	let prompt = templates[name];

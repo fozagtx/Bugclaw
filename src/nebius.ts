@@ -3,9 +3,11 @@ import { config } from "./config.ts";
 
 export class NebiusClient {
 	private readonly env: NodeJS.ProcessEnv;
+	private readonly fetcher: typeof fetch;
 
-	constructor(env: NodeJS.ProcessEnv = process.env) {
+	constructor(env: NodeJS.ProcessEnv = process.env, fetcher: typeof fetch = globalThis.fetch) {
 		this.env = env;
+		this.fetcher = fetcher;
 	}
 
 	private async request(url: string, init: RequestInit): Promise<Response> {
@@ -14,7 +16,7 @@ export class NebiusClient {
 			const controller = new AbortController();
 			const timer = setTimeout(() => controller.abort(), 600_000);
 			try {
-				const response = await fetch(url, {
+				const response = await this.fetcher(url, {
 					...init,
 					headers: { authorization: `Bearer ${this.env.NEBIUS_API_KEY}`, ...init.headers },
 					signal: controller.signal,
@@ -31,12 +33,23 @@ export class NebiusClient {
 		throw new Error("Nebius request failed after one retry");
 	}
 
-	async complete(model: string, system: string, prompt: string) {
+	async complete(model: string, system: string, prompt: string, schema?: { name: string; schema: Record<string, unknown> }) {
 		const { baseUrl } = config(this.env);
+		const body: Record<string, unknown> = {
+			model: model.replace(/^nebius\//, ""),
+			max_tokens: 16000,
+			messages: [{ role: "system", content: system }, { role: "user", content: prompt }],
+		};
+		if (schema) {
+			body.response_format = {
+				type: "json_schema",
+				json_schema: { name: schema.name, strict: true, schema: schema.schema },
+			};
+		}
 		const response = await this.request(`${baseUrl}/chat/completions`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ model: model.replace(/^nebius\//, ""), max_tokens: 16000, messages: [{ role: "system", content: system }, { role: "user", content: prompt }] }),
+			body: JSON.stringify(body),
 		});
 		if (!response.ok) throw new Error(`Nebius HTTP ${response.status}`);
 		return parseChatResponse(await response.json());

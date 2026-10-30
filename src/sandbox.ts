@@ -49,8 +49,12 @@ export async function runnerImageTag() {
 export async function runnerImage() {
 	if (!imageBuild) imageBuild = (async () => {
 		const tag = await runnerImageTag();
-		await exec("docker", ["build","-t",tag,join(root,"sandbox")], {timeout:900000});
-		const image = JSON.parse((await exec("docker", ["image","inspect",tag])).stdout)[0];
+		let image: any;
+		try { image = JSON.parse((await exec("docker", ["image","inspect",tag])).stdout)[0]; }
+		catch {
+			await exec("docker", ["build","-t",tag,join(root,"sandbox")], {timeout:900000});
+			image = JSON.parse((await exec("docker", ["image","inspect",tag])).stdout)[0];
+		}
 		return { tag, image };
 	})();
 	try {

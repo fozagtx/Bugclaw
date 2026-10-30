@@ -7,7 +7,7 @@ import { config } from "./config.ts";
 import { NebiusClient } from "./nebius.ts";
 import { Sandbox, SandboxError } from "./sandbox.ts";
 import { writeEvidence } from "./evidence.ts";
-import { renderPrompt, type PromptName } from "./prompts.ts";
+import { OUTPUT_SCHEMAS, renderPrompt, type PromptName } from "./prompts.ts";
 import { Store } from "./store.ts";
 
 const exec = promisify(execFile);
@@ -20,23 +20,50 @@ export function classify(result: { exitCode: number; timedOut: boolean; stdout: 
 	return "inconclusive";
 }
 
+function repairEscapedContent(content: string): { content: string; repaired?: "unescaped-newlines" } {
+	if (content.includes("\n") || !content.includes("\\n")) return { content };
+	return {
+		content: content.replace(/\\n|\\t|\\"|\\\\/g, (escape) => {
+			switch (escape) {
+				case "\\n": return "\n";
+				case "\\t": return "\t";
+				case '\\"': return '"';
+				case "\\\\": return "\\";
+				default: return escape;
+			}
+		}),
+		repaired: "unescaped-newlines",
+	};
+}
+
 export function validatePoc(poc: any, citedFiles: string[]) {
 	if (!poc || !Array.isArray(poc.files) || poc.files.length < 1 || poc.files.length > 3 || !Array.isArray(poc.command) || !poc.command.length || poc.command.some((part: unknown) => typeof part !== "string")) throw new Error("invalid PoC shape");
+	let repaired: "unescaped-newlines" | undefined;
 	for (const file of poc.files) {
 		if (typeof file.path !== "string" || typeof file.content !== "string") throw new Error("invalid PoC file");
 		const parts = file.path.replaceAll("\\", "/").split("/");
 		if (file.path.startsWith("/") || parts.some((part: string) => part === "..") || parts[0] !== ".bugclaw" || parts[1] !== "poc") throw new Error("PoC paths must be under .bugclaw/poc/");
+		const normalized = repairEscapedContent(file.content);
+		file.content = normalized.content;
+		repaired ??= normalized.repaired;
 		if (file.content.split("\n").length > 120) throw new Error("PoC exceeds 120 lines");
 	}
 	const references = [...poc.files.map((file: any) => file.content), ...poc.command].join("\n");
 	if (!citedFiles.some((file) => references.includes(file) || references.includes(basename(file, extname(file)))) ) throw new Error("does not exercise cited code");
+	return repaired;
 }
 
 export function validateFixFiles(value: unknown, citedFiles: string[]) {
 	if (!Array.isArray(value) || !value.length || value.some((file: any) => !file || !citedFiles.includes(file.path) || typeof file.content !== "string")) {
 		throw new Error("fix changes files outside cited source");
 	}
-	return value as Array<{ path: string; content: string }>;
+	let repaired: "unescaped-newlines" | undefined;
+	const files = (value as Array<{ path: string; content: string }>).map((file) => {
+		const normalized = repairEscapedContent(file.content);
+		repaired ??= normalized.repaired;
+		return { ...file, content: normalized.content };
+	});
+	return { files, repaired };
 }
 
 export async function reproduce(scanId: string, candidateId?: string, services: { store?: Store; model?: NebiusClient; sandbox?: Sandbox } = {}) {
@@ -61,6 +88,7 @@ export async function reproduce(scanId: string, candidateId?: string, services: 
 		const sourceData = await Promise.all(files.map(async (file) => ({ path: file, content: await readFile(resolve(snapshot, file), "utf8") })));
 		const citedFilesWithLines = sourceData.map((file) => `${file.path}\n${file.content.split("\n").map((line, index) => `${index + 1}: ${line}`).join("\n")}`);
 		let poc: any = null;
+		let pocRepair: "unescaped-newlines" | undefined;
 		let vulnerableRun: any = null;
 		let status = "inconclusive";
 		for (let n = 1; n <= 3; n++) {
@@ -74,14 +102,14 @@ export async function reproduce(scanId: string, candidateId?: string, services: 
 					PREVIOUS_POC_JSON: poc,
 					SANDBOX_RESULT: vulnerableRun && { exitCode: vulnerableRun.exitCode, stdoutTail: tail(vulnerableRun.stdout), stderrTail: tail(vulnerableRun.stderr), timedOut: vulnerableRun.timedOut },
 				});
-				const generated = await model.complete(cfg.models.repro, prompt.system, prompt.prompt);
+				const generated = await model.complete(cfg.models.repro, prompt.system, prompt.prompt, OUTPUT_SCHEMAS[promptName]);
 				poc = generated.value;
-				validatePoc(poc, files);
+				pocRepair = validatePoc(poc, files);
 				const result = await sandbox.run(snapshot, poc.files, poc.command, 120);
 				const classification = classify(result);
 				const evidence = await writeEvidence({
 					dataDir: cfg.dataDir, scanId, candidateId: row.id, step: "poc", number: n, files: poc.files, argv: poc.command, run: result,
-					meta: { snapshotHash: (store.scan(scanId) as any)?.snapshot_hash, ...result, modelId: cfg.models.repro, tokens: { input: generated.inputTokens, output: generated.outputTokens }, classification, startedAt: started, endedAt: new Date().toISOString() },
+					meta: { snapshotHash: (store.scan(scanId) as any)?.snapshot_hash, ...result, modelId: cfg.models.repro, tokens: { input: generated.inputTokens, output: generated.outputTokens }, classification, ...(pocRepair ? { repaired: pocRepair } : {}), startedAt: started, endedAt: new Date().toISOString() },
 				});
 				store.attempt(row.id, "poc", { status: classification, evidence });
 				if (classification === "safe") { status = "not-reproduced"; break; }
@@ -102,7 +130,7 @@ export async function reproduce(scanId: string, candidateId?: string, services: 
 				SANDBOX_RESULT: { exitCode: vulnerableRun.exitCode, stdoutTail: tail(vulnerableRun.stdout), stderrTail: tail(vulnerableRun.stderr) },
 				CITED_FILES_WITH_LINE_NUMBERS: citedFilesWithLines,
 			});
-			const judgment = await model.complete(cfg.models.judge, judgePrompt.system, judgePrompt.prompt);
+			const judgment = await model.complete(cfg.models.judge, judgePrompt.system, judgePrompt.prompt, OUTPUT_SCHEMAS.JUDGE);
 			store.attempt(row.id, "judge", {
 				status: judgment.value.verdict,
 				verdict: judgment.value.verdict,
@@ -121,7 +149,7 @@ export async function reproduce(scanId: string, candidateId?: string, services: 
 						CANDIDATE_JSON: raw, POC_JSON: poc, PREVIOUS_FIX_JSON: previousFix,
 						SANDBOX_RESULT: vulnerableRun, CITED_FILES_FULL: sourceData,
 					});
-					const proposal = await model.complete(cfg.models.fix, prompt.system, prompt.prompt);
+					const proposal = await model.complete(cfg.models.fix, prompt.system, prompt.prompt, OUTPUT_SCHEMAS[attempt ? "FIX_RETRY" : "FIX"]);
 					previousFix = proposal.value;
 					const fixDetails = {
 						summary: proposal.value.summary,
@@ -129,7 +157,12 @@ export async function reproduce(scanId: string, candidateId?: string, services: 
 						tokens: { input: proposal.inputTokens, output: proposal.outputTokens },
 					};
 					let fixFiles: Array<{ path: string; content: string }>;
-					try { fixFiles = validateFixFiles(proposal.value.files, files); }
+					let fixRepair: "unescaped-newlines" | undefined;
+					try {
+						const validated = validateFixFiles(proposal.value.files, files);
+						fixFiles = validated.files;
+						fixRepair = validated.repaired;
+					}
 					catch {
 						store.attempt(row.id, "fix", { status: "fix-failed", reason: "fix changes files outside cited source", ...fixDetails });
 						break;
@@ -156,7 +189,7 @@ export async function reproduce(scanId: string, candidateId?: string, services: 
 						const classification = classify(result);
 						await writeEvidence({
 							dataDir: cfg.dataDir, scanId, candidateId: row.id, step: "fix", number: attempt + 1, files: [...poc.files, ...fixFiles], argv: poc.command, run: result,
-							meta: { snapshotHash: (store.scan(scanId) as any)?.snapshot_hash, ...result, modelId: cfg.models.fix, tokens: { input: proposal.inputTokens, output: proposal.outputTokens }, classification, startedAt: fixStarted, endedAt: new Date().toISOString() },
+							meta: { snapshotHash: (store.scan(scanId) as any)?.snapshot_hash, ...result, modelId: cfg.models.fix, tokens: { input: proposal.inputTokens, output: proposal.outputTokens }, classification, ...(pocRepair || fixRepair ? { repaired: "unescaped-newlines" } : {}), startedAt: fixStarted, endedAt: new Date().toISOString() },
 							fixDiff: diff,
 						});
 						fixed = classification === "safe";

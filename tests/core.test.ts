@@ -5,7 +5,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 import { Sandbox } from "../src/sandbox.ts";
-import { firstJson, parseChatResponse } from "../src/nebius.ts";
+import { firstJson, NebiusClient, parseChatResponse } from "../src/nebius.ts";
+import { OUTPUT_SCHEMAS } from "../src/prompts.ts";
 import { makeSnapshot } from "../src/snapshot.ts";
 import { classify, validateFixFiles, validatePoc } from "../src/repro.ts";
 import { evidencePath, writeEvidence } from "../src/evidence.ts";
@@ -38,6 +39,24 @@ test("Nebius rejects non-empty tool calls and truncated responses", () => {
 	assert.throws(() => parseChatResponse({ choices: [{ finish_reason: "length", message: { content: null, reasoning_content: "ignored" } }] }), /incomplete/);
 });
 
+test("Nebius PoC requests use strict JSON Schema response formatting", async () => {
+	let requestBody: any;
+	const client = new NebiusClient(
+		{ NEBIUS_API_KEY: "unit-test-key", NEBIUS_BASE_URL: "https://example.invalid/v1" },
+		async (_url, init) => {
+			requestBody = JSON.parse(String(init?.body));
+			return new Response(JSON.stringify({
+				choices: [{ finish_reason: "stop", message: { content: JSON.stringify({ files: [{ path: ".bugclaw/poc/test.js", content: "console.log('ok')" }], command: ["node", ".bugclaw/poc/test.js"], rationale: "exercise cited code" }), tool_calls: null } }],
+			}), { status: 200 });
+		},
+	);
+	await client.complete("nebius/nvidia/nemotron-3-super-120b-a12b", "system", "prompt", OUTPUT_SCHEMAS.POC);
+	assert.deepEqual(requestBody.response_format, {
+		type: "json_schema",
+		json_schema: { name: OUTPUT_SCHEMAS.POC.name, strict: true, schema: OUTPUT_SCHEMAS.POC.schema },
+	});
+});
+
 test("POC classification requires both the marker and its specified exit code", () => {
 	for (const [result, expected] of [
 		[{ exitCode: 1, timedOut: false, stdout: "BUGCLAW_VULNERABLE" }, "vulnerable"],
@@ -56,9 +75,32 @@ test("POC files stay under the reserved directory and cite source", () => {
 	assert.throws(() => validatePoc({ files: [{ path: ".bugclaw/poc/check.js", content: "console.log('safe')" }], command: ["node"] }, cited), /does not exercise cited code/);
 });
 
+test("POC validation repairs escaped file text once and preserves files with real newlines", () => {
+	const escaped = {
+		files: [{ path: ".bugclaw/poc/check.js", content: "require('../../src/config.ts');\\nconsole.log(\\\"ok\\\");\\nconst tab = 'a\\tb';\\nconst slash = 'c\\\\d';" }],
+		command: ["node", ".bugclaw/poc/check.js"],
+	};
+	assert.equal(validatePoc(escaped, ["src/config.ts"]), "unescaped-newlines");
+	assert.equal(escaped.files[0].content, "require('../../src/config.ts');\nconsole.log(\"ok\");\nconst tab = 'a\tb';\nconst slash = 'c\\d';");
+
+	const realNewlines = {
+		files: [{ path: ".bugclaw/poc/check.js", content: "require('../../src/config.ts');\n// literal \\n stays" }],
+		command: ["node", ".bugclaw/poc/check.js"],
+	};
+	const original = realNewlines.files[0].content;
+	assert.equal(validatePoc(realNewlines, ["src/config.ts"]), undefined);
+	assert.equal(realNewlines.files[0].content, original);
+});
+
 test("fix proposals are restricted to cited source files", () => {
-	assert.deepEqual(validateFixFiles([{ path: "src/config.ts", content: "export {};" }], ["src/config.ts"]), [{ path: "src/config.ts", content: "export {};" }]);
+	assert.deepEqual(validateFixFiles([{ path: "src/config.ts", content: "export {};" }], ["src/config.ts"]).files, [{ path: "src/config.ts", content: "export {};" }]);
 	assert.throws(() => validateFixFiles([{ path: "src/other.ts", content: "export {};" }], ["src/config.ts"]), /outside cited source/);
+});
+
+test("fix validation repairs literal escaped newlines", () => {
+	const result = validateFixFiles([{ path: "src/config.ts", content: "const value = 1;\\nexport { value };" }], ["src/config.ts"]);
+	assert.equal(result.repaired, "unescaped-newlines");
+	assert.deepEqual(result.files, [{ path: "src/config.ts", content: "const value = 1;\nexport { value };" }]);
 });
 
 test("evidence paths cannot escape the scans directory", () => {
