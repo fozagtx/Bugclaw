@@ -29,7 +29,7 @@ const JUDGE = `Judge whether this sandbox result genuinely demonstrates the cand
 Keys: verdict (genuine|tautological|unclear), reason (string).
 CANDIDATE_DATA=\${CANDIDATE_JSON}
 POC=\${POC_JSON}
-SANDBOX_RESULT=\${ {exitCode, stdoutTail, stderrTail} }
+SANDBOX_RESULT=\${SANDBOX_RESULT}
 SOURCE_DATA=\${CITED_FILES_WITH_LINE_NUMBERS}`;
 
 const FIX = `Write the smallest fix for the reproduced vulnerability. Change only the cited files. Keep the public behavior for legitimate inputs. Do not edit or delete anything under .bugclaw/. The same proof-of-concept will be re-run against your patched files and must then print BUGCLAW_SAFE and exit 0.
@@ -40,7 +40,7 @@ SOURCE_DATA=\${CITED_FILES_FULL}`;
 
 const FIX_RETRY = `Your fix did not make the proof-of-concept pass. Same rules and keys.
 PREVIOUS_FIX=\${PREVIOUS_FIX_JSON}
-SANDBOX_RESULT=\${ {exitCode, stdoutTail, stderrTail, timedOut} }
+SANDBOX_RESULT=\${SANDBOX_RESULT}
 CANDIDATE_DATA=\${CANDIDATE_JSON}
 POC=\${POC_JSON}
 SOURCE_DATA=\${CITED_FILES_FULL}`;
@@ -115,7 +115,10 @@ export function renderPrompt(name: PromptName, variables: Record<string, unknown
 	const templates = { POC, POC_RETRY, JUDGE, FIX, FIX_RETRY };
 	let prompt = templates[name];
 	for (const [key, value] of Object.entries(variables)) {
+		if (key === "RUNTIMES") continue;
 		prompt = prompt.replaceAll(`\${${key}}`, JSON.stringify(value));
 	}
+	const unrendered = prompt.match(/\$\{[^}]*\}/g)?.find((match) => match !== "${RUNTIMES}");
+	if (unrendered) throw new Error(`Unrendered prompt placeholder in ${name}: ${unrendered}`);
 	return { system: SYSTEM, prompt: prompt.replaceAll("\${RUNTIMES}", RUNTIMES) };
 }

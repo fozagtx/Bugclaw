@@ -230,11 +230,18 @@ export async function reproduce(scanId: string, candidateId?: string, services: 
 				terminalReason = undefined;
 				let fixed = false;
 				let previousFix: unknown = null;
+				let previousFixRun: Awaited<ReturnType<Sandbox["run"]>> | undefined;
 				for (let attempt = 0; attempt < 2; attempt++) {
 					const fixStarted = new Date().toISOString();
 					const prompt = renderPrompt(attempt ? "FIX_RETRY" : "FIX", {
 						CANDIDATE_JSON: raw, POC_JSON: poc, PREVIOUS_FIX_JSON: previousFix,
-						SANDBOX_RESULT: vulnerableRun, CITED_FILES_FULL: sourceData,
+						SANDBOX_RESULT: previousFixRun ? {
+							exitCode: previousFixRun.exitCode,
+							stdoutTail: tail(previousFixRun.stdout),
+							stderrTail: tail(previousFixRun.stderr),
+							timedOut: previousFixRun.timedOut,
+						} : { notRun: true },
+						CITED_FILES_FULL: sourceData,
 					});
 					const proposal = await model.complete(cfg.models.fix, prompt.system, prompt.prompt, OUTPUT_SCHEMAS[attempt ? "FIX_RETRY" : "FIX"]);
 					previousFix = proposal.value;
@@ -272,6 +279,7 @@ export async function reproduce(scanId: string, candidateId?: string, services: 
 							status = "sandbox-error";
 							break;
 						}
+						previousFixRun = result;
 						const diff = await getDiff(snapshot, patched);
 						const classification = classify(result);
 						await writeEvidence({
@@ -282,7 +290,6 @@ export async function reproduce(scanId: string, candidateId?: string, services: 
 						fixed = classification === "safe";
 						store.attempt(row.id, "fix", { status: fixed ? "fix-verified" : "fix-failed", ...fixDetails });
 						if (fixed) break;
-						vulnerableRun = result;
 					} finally { await rm(patched, { recursive: true, force: true }); }
 				}
 				if (status !== "sandbox-error") status = fixed ? "fix-verified" : "fix-failed";

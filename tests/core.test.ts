@@ -70,7 +70,7 @@ function setFixtureCandidateStatus(fixture: { candidateId: string; store: Store 
 	return data;
 }
 
-function makeGenuineReproModel() {
+function makeGenuineReproModel(onPrompt?: (kind: "judge" | "fix-retry", prompt: string) => void) {
 	return {
 		async complete(_modelId: string, _system: string, prompt: string) {
 			let value;
@@ -84,8 +84,12 @@ function makeGenuineReproModel() {
 					rationale: "exercise src/main.js",
 				};
 			} else if (prompt.startsWith("Judge whether")) {
+				onPrompt?.("judge", prompt);
 				value = { verdict: "genuine", reason: "The PoC depends on the cited code." };
-			} else if (prompt.startsWith("Write the smallest fix") || prompt.startsWith("Your fix did not")) {
+			} else if (prompt.startsWith("Your fix did not")) {
+				onPrompt?.("fix-retry", prompt);
+				value = { files: [{ path: "src/main.js", content: "module.exports = {};\n" }], summary: "Proposed fixture fix" };
+			} else if (prompt.startsWith("Write the smallest fix")) {
 				value = { files: [{ path: "src/main.js", content: "module.exports = {};\n" }], summary: "Proposed fixture fix" };
 			} else {
 				throw new Error(`unexpected prompt: ${prompt.slice(0, 40)}`);
@@ -380,11 +384,47 @@ test("POC relative imports must resolve to a PoC or snapshot file", () => {
 });
 
 test("POC_RETRY renders the previous contract error", () => {
-	const prompt = renderPrompt("POC_RETRY", { CONTRACT_ERROR: "missing import", SANDBOX_RESULT: { notRun: true } }).prompt;
+	const prompt = renderPrompt("POC_RETRY", {
+		PREVIOUS_POC_JSON: {}, SANDBOX_RESULT: { notRun: true }, CONTRACT_ERROR: "missing import",
+		CANDIDATE_JSON: {}, CITED_FILES_WITH_LINE_NUMBERS: "",
+	}).prompt;
 	assert.ok(prompt.includes('SANDBOX_RESULT={"notRun":true}\nCONTRACT_ERROR="missing import"'));
-	assert.match(renderPrompt("POC", {}).prompt, /Never substitute a stub, mock, fake or hand-written replacement/);
-	assert.match(renderPrompt("POC", {}).prompt, /Return \{"cannotReproduce":/);
-	assert.match(renderPrompt("POC", {}).prompt, /Detect the vulnerable effect by its presence or by a unique marker value you choose/);
+	const poc = renderPrompt("POC", {
+		RUNTIMES: "node 22, python 3.11, forge/anvil (Foundry)",
+		CANDIDATE_JSON: {}, CITED_FILES_WITH_LINE_NUMBERS: "",
+		PREVIOUS_POC_JSON: null, SANDBOX_RESULT: { notRun: true }, CONTRACT_ERROR: "none",
+	}).prompt;
+	assert.match(poc, /Never substitute a stub, mock, fake or hand-written replacement/);
+	assert.match(poc, /Return \{"cannotReproduce":/);
+	assert.match(poc, /Detect the vulnerable effect by its presence or by a unique marker value you choose/);
+});
+
+test("all prompt templates render their call-site variables and reject missing values", () => {
+	const pocVariables = {
+		RUNTIMES: "node 22, python 3.11, forge/anvil (Foundry)",
+		CANDIDATE_JSON: {}, CITED_FILES_WITH_LINE_NUMBERS: "src/main.js:1",
+		PREVIOUS_POC_JSON: {}, SANDBOX_RESULT: { notRun: true }, CONTRACT_ERROR: "none",
+	};
+	const sandboxResult = { exitCode: 1, stdoutTail: "BUGCLAW_VULNERABLE", stderrTail: "", timedOut: false };
+	const prompts = [
+		renderPrompt("POC", pocVariables),
+		renderPrompt("POC_RETRY", pocVariables),
+		renderPrompt("JUDGE", {
+			CANDIDATE_JSON: {}, POC_JSON: {}, SANDBOX_RESULT: sandboxResult, CITED_FILES_WITH_LINE_NUMBERS: "src/main.js:1",
+		}),
+		renderPrompt("FIX", {
+			CANDIDATE_JSON: {}, POC_JSON: {}, PREVIOUS_FIX_JSON: null, SANDBOX_RESULT: sandboxResult, CITED_FILES_FULL: "source",
+		}),
+		renderPrompt("FIX_RETRY", {
+			CANDIDATE_JSON: {}, POC_JSON: {}, PREVIOUS_FIX_JSON: {}, SANDBOX_RESULT: sandboxResult, CITED_FILES_FULL: "source",
+		}),
+	];
+	for (const { prompt } of prompts) assert.doesNotMatch(prompt, /\$\{/);
+	assert.ok(prompts[2].prompt.includes("BUGCLAW_VULNERABLE"));
+	assert.throws(
+		() => renderPrompt("JUDGE", { CANDIDATE_JSON: {}, POC_JSON: {}, CITED_FILES_WITH_LINE_NUMBERS: "" }),
+		{ message: "Unrendered prompt placeholder in JUDGE: ${SANDBOX_RESULT}" },
+	);
 });
 
 test("POC validation repairs escaped file text once and preserves files with real newlines", () => {
@@ -798,6 +838,38 @@ test("a genuine fix failure can replace a previously verified fix status", async
 		const fixAttempts = (fixture.store.attempts(fixture.candidateId) as any[]).filter((attempt) => attempt.step === "fix");
 		assert.equal(fixAttempts.length, 2);
 		assert.ok(fixAttempts.every((attempt) => JSON.parse(attempt.result).status === "fix-failed"));
+	} finally { await fixture.cleanup(); }
+});
+
+test("reproduction supplies sandbox output to judge and fix-retry prompts", async () => {
+	const fixture = await makeReproFixture();
+	const pocStdout = "BUGCLAW_VULNERABLE from the PoC run";
+	const fixStdout = "BUGCLAW_VULNERABLE from the failed fix run";
+	let judgePrompt = "";
+	let fixRetryPrompt = "";
+	const model = makeGenuineReproModel((kind, prompt) => {
+		if (kind === "judge") judgePrompt = prompt;
+		else fixRetryPrompt = prompt;
+	});
+	let sandboxRuns = 0;
+	const sandbox = {
+		async run() {
+			sandboxRuns++;
+			if (sandboxRuns === 1) return { exitCode: 1, stdout: pocStdout, stderr: "poc stderr", timedOut: false };
+			if (sandboxRuns === 2) return { exitCode: 1, stdout: fixStdout, stderr: "fix stderr", timedOut: false };
+			return { exitCode: 0, stdout: "BUGCLAW_SAFE", stderr: "", timedOut: false };
+		},
+	};
+	try {
+		const output = await reproduce(fixture.scanId, fixture.candidateId, { store: fixture.store, model, sandbox } as any);
+		assert.equal(output[0].status, "fix-verified");
+		assert.ok(judgePrompt.includes(pocStdout));
+		assert.ok(fixRetryPrompt.includes(`SANDBOX_RESULT=${JSON.stringify({
+			exitCode: 1,
+			stdoutTail: fixStdout,
+			stderrTail: "fix stderr",
+			timedOut: false,
+		})}`));
 	} finally { await fixture.cleanup(); }
 });
 
